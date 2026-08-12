@@ -57,15 +57,23 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
 
   const statePath = path.resolve(options.state ?? DEFAULT_STATE);
   const logDir = path.resolve(options.logDir ?? DEFAULT_LOG_DIR);
+  const outputWrite = dependencies.outputWrite ?? console.log;
   const state = await loadState(statePath);
   const releaseLock = await acquireLock();
   const reports = [];
+  const progress = createProgressReporter({
+    enabled: !options.json,
+    write: dependencies.progressWrite ?? outputWrite,
+    now: dependencies.now
+  });
   let exitCode = 0;
   try {
     const selected = selectAccounts(config.accounts, options.account);
+    progress.start({ command: options.command, total: selected.length, dryRun: options.dryRun });
     for (const [index, account] of selected) {
       const alias = account.name || `account-${index + 1}`;
       const report = { alias, command: options.command, dryRun: options.dryRun, startedAt: new Date().toISOString(), actions: [] };
+      const accountProgress = progress.account({ alias, current: reports.length + 1, total: selected.length });
       try {
         const api = new PlaceGameApi({
           baseUrl: account.server ?? config.server,
@@ -75,8 +83,8 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         });
         const accountState = state.accounts[alias] ??= { actions: {} };
         accountState.actions ??= {};
-        await authenticate({ api, account, accountState, state, statePath });
-        await runCommand({ api, alias, accountState, state, statePath, config, options, report });
+        await accountProgress.stage("authentication", () => authenticate({ api, account, accountState, state, statePath }));
+        await runCommand({ api, alias, accountState, state, statePath, config, options, report }, accountProgress);
         report.ok = true;
       } catch (error) {
         report.ok = false;
@@ -84,32 +92,46 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         exitCode = 1;
       }
       report.finishedAt = new Date().toISOString();
+      accountProgress.finish({ ok: report.ok, error: report.error });
       reports.push(report);
     }
     await appendReports(logDir, reports, config.automation.logRetentionDays);
+    progress.finish({
+      succeeded: reports.filter((report) => report.ok).length,
+      failed: reports.filter((report) => !report.ok).length
+    });
   } finally {
     await releaseLock();
   }
 
   const output = { command: options.command, dryRun: options.dryRun, reports };
-  console.log(options.json ? JSON.stringify(output) : formatReports(reports));
+  outputWrite(options.json ? JSON.stringify(output) : `\nSummary\n${formatReports(reports)}`);
   return exitCode;
 }
 
-async function runCommand(context) {
+async function runCommand(context, progress) {
   if (context.options.command === "status") {
-    await runStatus(context);
+    await runStage(progress, context, "status", runStatus);
   } else if (context.options.command === "idle") {
-    await runIdle(context);
+    await runStage(progress, context, "idle and map", runIdle);
   } else if (context.options.command === "daily") {
-    await runDaily(context);
+    await runStage(progress, context, "daily rewards", runDaily);
   } else if (context.options.command === "arcade") {
-    await runArcade(context);
+    await runStage(progress, context, "free arcade", runArcade);
   } else {
-    await runIdle(context);
-    await runArcade(context);
-    await runDaily(context);
+    await runStage(progress, context, "idle and map", runIdle);
+    await runStage(progress, context, "free arcade", runArcade);
+    await runStage(progress, context, "daily rewards", runDaily);
   }
+}
+
+async function runStage(progress, context, label, operation) {
+  const actionCount = context.report.actions.length;
+  return progress.stage(
+    label,
+    () => operation(context),
+    () => formatResultCount(context.report.actions.length - actionCount)
+  );
 }
 
 async function authenticate({ api, account, accountState, state, statePath }) {
@@ -812,6 +834,77 @@ function pruneActions(actions) {
 function safeError(error) {
   if (error instanceof ApiError) return `${error.path ?? "request"}: ${error.authentication ? "authentication rejected" : error.ambiguous ? "outcome uncertain after network failure" : "request rejected"}`;
   return String(error?.message ?? "unknown error").replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
+}
+
+export function createProgressReporter({ enabled = true, write = console.log, now = () => Date.now() } = {}) {
+  if (!enabled) return createSilentProgressReporter();
+  const startedAt = now();
+  let writable = true;
+  const safeWrite = (line) => {
+    if (!writable) return;
+    try {
+      write(line);
+    } catch {
+      writable = false;
+    }
+  };
+
+  return {
+    start({ command, total, dryRun }) {
+      safeWrite(`Starting ${command}${dryRun ? " dry run" : ""} for ${total} ${pluralize(total, "account")}.`);
+    },
+    account({ alias, current, total }) {
+      const prefix = `[${current}/${total}] ${alias}`;
+      const accountStartedAt = now();
+      safeWrite(`${prefix}: starting`);
+      return {
+        async stage(label, operation, describeResult) {
+          const stageStartedAt = now();
+          safeWrite(`${prefix}: ${label}...`);
+          try {
+            const result = await operation();
+            const detail = describeResult?.(result);
+            safeWrite(`${prefix}: ${label} done (${formatDuration(now() - stageStartedAt)}${detail ? `, ${detail}` : ""})`);
+            return result;
+          } catch (error) {
+            safeWrite(`${prefix}: ${label} failed (${formatDuration(now() - stageStartedAt)}): ${safeError(error)}`);
+            throw error;
+          }
+        },
+        finish({ ok, error }) {
+          safeWrite(`${prefix}: ${ok ? "completed" : `failed (${error})`} (${formatDuration(now() - accountStartedAt)})`);
+        }
+      };
+    },
+    finish({ succeeded, failed }) {
+      safeWrite(`Finished: ${succeeded} succeeded, ${failed} failed (${formatDuration(now() - startedAt)}).`);
+    }
+  };
+}
+
+function createSilentProgressReporter() {
+  return {
+    start() {},
+    account() {
+      return {
+        stage(_label, operation) { return operation(); },
+        finish() {}
+      };
+    },
+    finish() {}
+  };
+}
+
+function formatDuration(milliseconds) {
+  return `${(Math.max(0, milliseconds) / 1_000).toFixed(1)}s`;
+}
+
+function formatResultCount(count) {
+  return `${count} ${pluralize(count, "result")}`;
+}
+
+function pluralize(count, singular) {
+  return count === 1 ? singular : `${singular}s`;
 }
 
 function formatReports(reports) {
