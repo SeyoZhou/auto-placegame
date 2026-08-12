@@ -1,0 +1,29 @@
+{
+  "server": "https://api.placegame.cn",
+  "accounts": [
+    {
+      "name": "account-1",
+      "username": "replace-me",
+      "password": "replace-me"
+    },
+    {
+      "name": "account-2",
+      "username": "replace-me",
+      "password": "replace-me"
+    }
+  ],
+  "automation": {
+    "logRetentionDays": 30,
+    "idle": {
+      "collectEveryHours": 6,
+      "jitterMinutes": 12,
+      "urgentLeadMinutes": 30
+    },
+    "arcade": {
+      "treasureSafeCards": 2
+    },
+    "daily": {
+      "activityRewardPoints": [20]
+    }
+  }
+}

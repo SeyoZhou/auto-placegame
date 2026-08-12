@@ -1,0 +1,12 @@
+[Unit]
+Description=PlaceGame daily automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory="__PROJECT__"
+ExecStart="__NODE__" "__PROJECT__/placegame-auto.mjs" run
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

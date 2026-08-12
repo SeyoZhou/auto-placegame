@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PlaceGame daily automation every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

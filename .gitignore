@@ -1,0 +1,17 @@
+.placegame-accounts.local.json
+.placegame-state.local.json
+.placegame-runtime/
+.placegame-logs/
+
+# Local editor, OS, and analysis metadata
+.DS_Store
+.idea/
+.xcodemap/
+
+# Internal planning and research notes
+docs/
+plans/
+
+# Upstream bundled CLI (not required by the automation runner)
+placegame-cli.mjs
+启动游戏.cmd

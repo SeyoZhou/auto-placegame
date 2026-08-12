@@ -1,0 +1,12 @@
+{
+  "name": "placegame-daily-automation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check placegame-auto.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
