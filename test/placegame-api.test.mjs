@@ -8,7 +8,7 @@ test("GET retries a transport failure with required CLI headers", async () => {
     baseUrl: "https://example.invalid",
     fetchImpl: async (_url, options) => {
       calls += 1;
-      assert.equal(options.headers["x-placegame-client-version"], "0.2.35");
+      assert.equal(options.headers["x-placegame-client-version"], "0.2.36");
       assert.equal(options.headers["x-placegame-client-platform"], "cli");
       assert.equal(options.headers["x-placegame-response-state"], "full");
       assert.equal(options.headers.authorization, "Bearer session-value");

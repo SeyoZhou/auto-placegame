@@ -29,7 +29,7 @@ import {
 } from "./lib/placegame-policy.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const CLIENT_VERSION = "0.2.35";
+const CLIENT_VERSION = "0.2.36";
 const DEFAULT_CONFIG = path.join(ROOT, ".placegame-accounts.local.json");
 const DEFAULT_STATE = path.join(ROOT, ".placegame-state.local.json");
 const DEFAULT_LOG_DIR = path.join(ROOT, ".placegame-logs");
