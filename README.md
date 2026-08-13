@@ -36,10 +36,30 @@ node placegame-auto.mjs run --dry-run
 node placegame-auto.mjs idle
 node placegame-auto.mjs daily
 node placegame-auto.mjs arcade
+node placegame-auto.mjs boss
 node placegame-auto.mjs run
 ```
 
-使用 `--account account-1` 选择指定别名的账号，使用 `--json` 获取结构化输出。`run` 会依次执行挂机/地图维护、免费街机和零成本每日领取。街机操作会提交允许的最低投注额，但只会在免费次数大于零时继续；如果响应表明需要付费或成本不为零，运行器会停止该账号的街机流程。
+使用 `--account account-1` 选择指定别名的账号，使用 `--json` 获取结构化输出。`run` 会依次执行挂机/地图维护、免费街机、个人首领和每日奖励。个人首领只使用共享的 5 次免费胜场，预测胜率不低于 80%，不使用门票，单轮最多提交 20 次挑战。每日奖励会领取签到、主线/支线、成就、图鉴、赛季、邮件、活跃宝箱和已达成的公会进度奖励，但不会自动捐献。
+
+每日活跃默认尝试领取 `20/40/60/80/100` 档。未达到 100 时，运行器先逐件安全分解普通、优秀和精良装备；默认保留所有 `小极品/极品/大极品` 和未知词条等级装备。仍不足时，每个账号每天最多购买一件实际成交额最低且不超过 300 金币的市场商品。运行器不会自动强化、上架、捐献或消费元宝，达到并领取 100 档后立即停止这些补充动作。
+
+可在 `automation.daily` 中调整安全范围：
+
+```json
+{
+  "activityRewardPoints": [20, 40, 60, 80, 100],
+  "marketMaxGold": 300,
+  "decomposition": {
+    "qualities": ["common", "excellent", "refined"],
+    "minLevel": 1,
+    "maxLevel": 20,
+    "protectPremiumAffixes": true
+  }
+}
+```
+
+`qualities` 支持 `common`、`excellent`、`refined`、`rare`、`epic`、`legendary` 和 `mythic`。省略 `minLevel` 或 `maxLevel` 表示该方向不设限制。先使用 `run --dry-run` 检查计划动作；模拟运行只读取状态和首领预览，不挑战、分解或购买。
 
 运行时 Session 和操作日志存储在 `.placegame-state.local.json` 中；脱敏后的 JSONL 报告写入 `.placegame-logs/`。这两个路径均已被 Git 忽略。
 每日 JSONL 报告默认保留 30 天；可通过账号配置中的 `automation.logRetentionDays` 调整保留时间。
@@ -101,10 +121,30 @@ node placegame-auto.mjs run --dry-run
 node placegame-auto.mjs idle
 node placegame-auto.mjs daily
 node placegame-auto.mjs arcade
+node placegame-auto.mjs boss
 node placegame-auto.mjs run
 ```
 
-Use `--account account-1` to select one alias and `--json` for structured output. `run` executes idle/map maintenance, free arcade, and zero-cost daily claims. Arcade actions submit the minimum allowed bet but proceed only when the free counter is positive; a paid or nonzero-cost response stops that account's arcade workflow.
+Use `--account account-1` to select one alias and `--json` for structured output. `run` executes idle/map maintenance, free arcade, personal bosses, and daily rewards. Personal-boss automation uses only the shared five free wins, requires at least an 80% predicted win chance, never spends tickets, and submits at most 20 challenges per run. Daily rewards include sign-in, main and side quests, achievements, codex, season, reward mail, activity chests, and earned guild progress; the runner never donates automatically.
+
+The activity ladder claims the known `20/40/60/80/100` tiers. If 100 is still incomplete, it decomposes safe common, excellent, and refined equipment one item at a time. Premium and unknown affix ranks are protected by default. The final fallback buys at most one lowest-charge market unit per account per day, capped at 300 gold. It never enhances, lists, donates, or spends rare currency, and stops activity actions immediately after the 100-point chest is claimed.
+
+Configure the safety boundary under `automation.daily`:
+
+```json
+{
+  "activityRewardPoints": [20, 40, 60, 80, 100],
+  "marketMaxGold": 300,
+  "decomposition": {
+    "qualities": ["common", "excellent", "refined"],
+    "minLevel": 1,
+    "maxLevel": 20,
+    "protectPremiumAffixes": true
+  }
+}
+```
+
+Supported quality names are `common`, `excellent`, `refined`, `rare`, `epic`, `legendary`, and `mythic`. Omit either level boundary to leave it open. Run `run --dry-run` first to inspect planned actions; dry-run performs reads and boss previews but never challenges, decomposes, or buys.
 
 Runtime Sessions and action journals are stored in `.placegame-state.local.json`. Redacted JSONL reports go to `.placegame-logs/`. Both paths are ignored by Git.
 Daily JSONL reports are retained for 30 days by default; change `automation.logRetentionDays` in the account config to adjust this.

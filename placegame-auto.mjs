@@ -20,9 +20,14 @@ import { ApiError, PlaceGameApi, dataOf } from "./lib/placegame-api.mjs";
 import {
   blackjackDecision,
   chooseAdventure,
+  chooseBossPreview,
   chooseCoinLane,
+  chooseLowestChargeMarketOrder,
+  chooseSafeDecomposition,
+  countProtectedDecomposition,
   effectiveMapRates,
   isIdleDue,
+  personalBossPreviewLayers,
   shouldChangeMap,
   stableJitterSeconds,
   stableKey
@@ -34,7 +39,31 @@ const DEFAULT_CONFIG = path.join(ROOT, ".placegame-accounts.local.json");
 const DEFAULT_STATE = path.join(ROOT, ".placegame-state.local.json");
 const DEFAULT_LOG_DIR = path.join(ROOT, ".placegame-logs");
 const LOCK_FILE = path.join(ROOT, ".placegame-runtime", "run.lock");
-const COMMANDS = new Set(["status", "idle", "daily", "arcade", "run"]);
+const COMMANDS = new Set(["status", "idle", "daily", "arcade", "boss", "run"]);
+const BOSS_MINIMUM_CHANCE = 80;
+const BOSS_SUBMISSION_LIMIT = 20;
+const KNOWN_ACTIVITY_POINTS = [20, 40, 60, 80, 100];
+const ACTIVITY_TARGET = 100;
+const ACTIVITY_MUTATION_LIMIT = 60;
+const DAILY_REWARD_LIMIT_IDENTITY = "daily-rewards:mutation-limit";
+const QUALITY_ALIASES = {
+  common: "white",
+  normal: "white",
+  white: "white",
+  excellent: "green",
+  green: "green",
+  refined: "blue",
+  blue: "blue",
+  rare: "purple",
+  purple: "purple",
+  epic: "orange",
+  orange: "orange",
+  legendary: "red",
+  red: "red",
+  mythic: "gold",
+  gold: "gold"
+};
+const QUALITY_KEYS = new Set(Object.values(QUALITY_ALIASES));
 
 class ArcadeSafetyError extends Error {
   constructor(message) {
@@ -115,12 +144,16 @@ async function runCommand(context, progress) {
   } else if (context.options.command === "idle") {
     await runStage(progress, context, "idle and map", runIdle);
   } else if (context.options.command === "daily") {
+    await runBestEffortBossStage(progress, context);
     await runStage(progress, context, "daily rewards", runDaily);
   } else if (context.options.command === "arcade") {
     await runStage(progress, context, "free arcade", runArcade);
+  } else if (context.options.command === "boss") {
+    await runStage(progress, context, "personal boss", runPersonalBoss);
   } else {
     await runStage(progress, context, "idle and map", runIdle);
     await runStage(progress, context, "free arcade", runArcade);
+    await runBestEffortBossStage(progress, context);
     await runStage(progress, context, "daily rewards", runDaily);
   }
 }
@@ -132,6 +165,17 @@ async function runStage(progress, context, label, operation) {
     () => operation(context),
     () => formatResultCount(context.report.actions.length - actionCount)
   );
+}
+
+async function runBestEffortBossStage(progress, context) {
+  const label = "personal boss";
+  try {
+    return await runStage(progress, context, label, runPersonalBoss);
+  } catch (error) {
+    context.report.actions.push({ type: "personal-boss", status: "failed", reason: safeError(error) });
+    context.report.warnings ??= [];
+    context.report.warnings.push(`${label}: ${safeError(error)}`);
+  }
 }
 
 async function authenticate({ api, account, accountState, state, statePath }) {
@@ -282,35 +326,436 @@ async function optimizeMap(context) {
   context.report.actions.push({ type: "map", status: "changed", from: decision.current?.key, to: decision.best.key });
 }
 
-async function runDaily(context) {
+export async function runDaily(context) {
   let state = await readDailyState(context.api);
+  if (state.guild?.unavailable === true) {
+    context.report.actions.push({ type: "guild-progress-reward", status: "unavailable", reason: "state-read-failed" });
+    context.report.warnings ??= [];
+    context.report.warnings.push(`guild rewards: ${state.guild.reason}`);
+  } else if (state.guild?.joined === false) {
+    context.report.actions.push({ type: "guild-progress-reward", status: "unavailable", reason: "not-member" });
+  }
+  const targetEnabled = context.config.automation.daily.activityRewardPoints.includes(ACTIVITY_TARGET);
+  const initiallyComplete = activityTierClaimed(state, ACTIVITY_TARGET);
+  const failedRewards = new Set();
+  const activitySafety = { blocked: false };
+  state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  if (targetEnabled
+    && activityStateKnown(state)
+    && !activityTierClaimed(state, ACTIVITY_TARGET)
+    && !activityPursuitBlocked(failedRewards, activitySafety)) {
+    state = await pursueActivity(context, state, failedRewards, activitySafety);
+  } else if (targetEnabled && !activityTierClaimed(state, ACTIVITY_TARGET) && activityPursuitBlocked(failedRewards, activitySafety)) {
+    context.report.actions.push({ type: "activity-target", status: "stopped", reason: "reward-claim-blocked" });
+  }
+  if (!context.options.dryRun && activityStateKnown(state)) {
+    state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  }
+  reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled);
+}
+
+async function claimDailyRewards(context, initialState, failedRewards, activitySafety) {
+  let state = initialState;
   let mutations = 0;
-  while (mutations < 60) {
-    const action = nextDailyAction(state, context.config.automation.daily.activityRewardPoints);
+  const dryRunPlanned = new Set();
+  while (mutations < ACTIVITY_MUTATION_LIMIT) {
+    const excludedRewards = dryRunPlanned.size > 0
+      ? new Set([...failedRewards, ...dryRunPlanned])
+      : failedRewards;
+    const action = nextDailyAction(state, context.config.automation.daily.activityRewardPoints, excludedRewards);
     if (!action) break;
+    const identity = dailyActionIdentity(action, state);
     if (context.options.dryRun) {
-      context.report.actions.push({ type: action.type, status: "planned", ...(action.point ? { point: action.point } : {}) });
-      state = pretendDailyClaimed(state, action);
+      context.report.actions.push(dailyActionReport(action, "planned"));
+      if (action.type === "activity-reward") dryRunPlanned.add(identity);
+      else state = pretendDailyClaimed(state, action);
       mutations += 1;
       continue;
     }
+
     try {
       await context.api.post(action.path, action.body);
-      state = await readDailyState(context.api);
-      if (dailyActionStillPending(state, action)) throw new Error(`${action.type} was not confirmed by state refresh`);
-      context.report.actions.push({ type: action.type, status: "claimed", ...(action.point ? { point: action.point } : {}) });
     } catch (error) {
-      if (!error.ambiguous) throw error;
-      state = await readDailyState(context.api);
-      if (dailyActionStillPending(state, action)) throw error;
-      context.report.actions.push({ type: action.type, status: "reconciled", ...(action.point ? { point: action.point } : {}) });
+      if (error.ambiguous) {
+        state = await readDailyState(context.api);
+        const outcome = dailyActionOutcome(state, action);
+        if (outcome === "claimed") {
+          context.report.actions.push(dailyActionReport(action, "reconciled"));
+        } else {
+          failedRewards.add(identity);
+          if (action.type === "activity-reward" && action.point === ACTIVITY_TARGET) {
+            activitySafety.blocked = true;
+          }
+          context.report.actions.push({
+            ...dailyActionReport(action, outcome === "unknown" ? "uncertain" : "failed"),
+            reason: outcome === "unknown" ? "claim outcome was not available after state refresh" : safeError(error)
+          });
+        }
+      } else {
+        failedRewards.add(identity);
+        context.report.actions.push({ ...dailyActionReport(action, "failed"), reason: safeError(error) });
+      }
+      mutations += 1;
+      continue;
+    }
+
+    state = await readDailyState(context.api);
+    const outcome = dailyActionOutcome(state, action);
+    if (outcome !== "claimed") {
+      failedRewards.add(identity);
+      if (action.type === "activity-reward" && action.point === ACTIVITY_TARGET) {
+        activitySafety.blocked = true;
+      }
+      context.report.actions.push({
+        ...dailyActionReport(action, outcome === "unknown" ? "uncertain" : "failed"),
+        reason: outcome === "unknown"
+          ? `${action.type} could not be confirmed because refreshed state omitted its collection`
+          : `${action.type} was not confirmed by state refresh`
+      });
+    } else {
+      context.report.actions.push(dailyActionReport(action, "claimed"));
     }
     mutations += 1;
   }
-  if (mutations >= 60) throw new Error("daily claim safety limit exceeded");
-  if (Number(state.view.navigation?.activityClaimableCount ?? 0) > 0) {
+  if (mutations >= ACTIVITY_MUTATION_LIMIT
+    && nextDailyAction(state, context.config.automation.daily.activityRewardPoints, failedRewards)) {
+    failedRewards.add(DAILY_REWARD_LIMIT_IDENTITY);
+    context.report.actions.push({ type: "daily-rewards", status: "stopped", reason: "mutation-limit" });
+  }
+  return state;
+}
+
+async function pursueActivity(context, initialState, failedRewards, activitySafety) {
+  let state = initialState;
+  const settings = context.config.automation.daily;
+  const skippedEquipment = new Set();
+  let candidateAttempts = 0;
+  let consecutivePreviewFailures = 0;
+  while (activityStateKnown(state)
+    && !activityTierClaimed(state, ACTIVITY_TARGET)
+    && !activityPursuitBlocked(failedRewards, activitySafety)
+    && candidateAttempts < ACTIVITY_MUTATION_LIMIT) {
+    const equipment = await readEquipment(context.api);
+    if (context.options.dryRun) {
+      const protectedCount = countProtectedDecomposition(equipment, settings.decomposition);
+      if (protectedCount > 0) {
+        context.report.actions.push({
+          type: "equipment-decompose",
+          status: "protected",
+          reason: "premium-or-unknown-affix",
+          count: protectedCount
+        });
+      }
+    }
+    const candidate = chooseSafeDecomposition(
+      equipment.filter((item) => !skippedEquipment.has(item?.id)),
+      settings.decomposition
+    );
+    if (!candidate) break;
+    candidateAttempts += 1;
+    if (context.options.dryRun) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "planned",
+        quality: candidate.quality,
+        level: candidate.level,
+        reason: "activity-target"
+      });
+      return purchaseActivityItem(context, state, failedRewards, activitySafety);
+    }
+
+    try {
+      const preview = dataOf(await context.api.post("/api/equipment/decompose-preview", { equipmentIds: [candidate.id] }));
+      if (!safeDecompositionPreview(preview, candidate.id)) {
+        skippedEquipment.add(candidate.id);
+        consecutivePreviewFailures = 0;
+        context.report.actions.push({ type: "equipment-decompose", status: "skipped", reason: "preview-unconfirmed" });
+        continue;
+      }
+      consecutivePreviewFailures = 0;
+    } catch (error) {
+      skippedEquipment.add(candidate.id);
+      context.report.actions.push({ type: "equipment-decompose", status: "failed", reason: safeError(error) });
+      if (transientRequestFailure(error)) {
+        consecutivePreviewFailures += 1;
+        if (consecutivePreviewFailures >= 3) {
+          context.report.actions.push({ type: "equipment-decompose", status: "stopped", reason: "preview-failure-limit" });
+          return state;
+        }
+      } else {
+        consecutivePreviewFailures = 0;
+      }
+      continue;
+    }
+
+    const beforeCount = finiteCounter(state.bootstrap.daily?.decomposeCount);
+    let ambiguousError;
+    try {
+      await context.api.post("/api/equipment/decompose", { equipmentIds: [candidate.id] });
+    } catch (error) {
+      if (!error.ambiguous) {
+        skippedEquipment.add(candidate.id);
+        context.report.actions.push({ type: "equipment-decompose", status: "failed", reason: safeError(error) });
+        continue;
+      }
+      ambiguousError = error;
+    }
+    state = await readDailyState(context.api);
+    const refreshedEquipment = await readEquipment(context.api);
+    const confirmed = counterIncreased(beforeCount, state.bootstrap.daily?.decomposeCount)
+      && !refreshedEquipment.some((item) => item?.id === candidate.id);
+    if (!confirmed) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "uncertain",
+        reason: ambiguousError ? "outcome-unknown" : "state-not-confirmed"
+      });
+      return state;
+    }
+    context.report.actions.push({
+      type: "equipment-decompose",
+      status: ambiguousError ? "reconciled" : "completed",
+      quality: candidate.quality,
+      level: candidate.level
+    });
+    allowActivityRewardRetry(failedRewards);
+    state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  }
+  if (!activityStateKnown(state)) {
+    context.report.actions.push({ type: "activity-target", status: "stopped", reason: "unknown-activity-state" });
+    return state;
+  }
+  if (activityPursuitBlocked(failedRewards, activitySafety)) {
+    context.report.actions.push({ type: "activity-target", status: "stopped", reason: "reward-claim-blocked" });
+    return state;
+  }
+  if (activityTierClaimed(state, ACTIVITY_TARGET)) return state;
+  if (candidateAttempts >= ACTIVITY_MUTATION_LIMIT) {
+    context.report.actions.push({ type: "equipment-decompose", status: "stopped", reason: "candidate-limit" });
+    return state;
+  }
+  return purchaseActivityItem(context, state, failedRewards, activitySafety);
+}
+
+async function purchaseActivityItem(context, state, failedRewards, activitySafety) {
+  const marketBuyCount = finiteCounter(state.bootstrap.daily?.marketBuyCount);
+  if (marketBuyCount === undefined) {
+    context.report.actions.push({ type: "market-buy", status: "skipped", reason: "unknown-daily-count" });
+    return state;
+  }
+  if (marketBuyCount > 0) {
+    context.report.actions.push({ type: "market-buy", status: "skipped", reason: "daily-purchase-used" });
+    return state;
+  }
+  const ordersData = dataOf(await context.api.get("/api/market/orders"));
+  const orders = Array.isArray(ordersData) ? ordersData : ordersData?.orders ?? [];
+  const selected = chooseLowestChargeMarketOrder(orders, context.config.automation.daily.marketMaxGold);
+  if (!selected) {
+    context.report.actions.push({ type: "market-buy", status: "skipped", reason: "no-eligible-order" });
+    return state;
+  }
+  if (context.options.dryRun) {
+    context.report.actions.push({
+      type: "market-buy",
+      status: "planned",
+      quantity: 1,
+      projectedGold: selected.charge,
+      reason: "if-activity-target-remains"
+    });
+    return state;
+  }
+
+  let ambiguousError;
+  try {
+    await context.api.post("/api/market/buy", { orderId: selected.order.id, quantity: 1 });
+  } catch (error) {
+    if (!error.ambiguous) {
+      context.report.actions.push({ type: "market-buy", status: "failed", projectedGold: selected.charge, reason: safeError(error) });
+      return state;
+    }
+    ambiguousError = error;
+  }
+  state = await readDailyState(context.api);
+  if (!counterIncreased(marketBuyCount, state.bootstrap.daily?.marketBuyCount)) {
+    context.report.actions.push({ type: "market-buy", status: "uncertain", projectedGold: selected.charge, reason: "outcome-unknown" });
+    return state;
+  }
+  context.report.actions.push({
+    type: "market-buy",
+    status: ambiguousError ? "reconciled" : "completed",
+    quantity: 1,
+    projectedGold: selected.charge
+  });
+  allowActivityRewardRetry(failedRewards);
+  state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  return state;
+}
+
+function reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled) {
+  if (!activityStateKnown(state)) {
+    context.report.activity = {
+      status: "incomplete",
+      claimed: [],
+      remaining: [...context.config.automation.daily.activityRewardPoints],
+      failedRewards: failedRewards.size,
+      reason: "unknown-activity-state"
+    };
+    context.report.actions.push({
+      type: "activity-target",
+      status: "pending",
+      point: ACTIVITY_TARGET,
+      reason: "unknown-activity-state"
+    });
+    return;
+  }
+  const claimed = new Set(state.bootstrap.daily?.claimedActivity ?? []);
+  const complete = claimed.has(ACTIVITY_TARGET);
+  const remaining = context.config.automation.daily.activityRewardPoints.filter((point) => !claimed.has(point));
+  context.report.activity = {
+    status: complete ? (initiallyComplete ? "already-complete" : "newly-complete") : "incomplete",
+    claimed: context.config.automation.daily.activityRewardPoints.filter((point) => claimed.has(point)),
+    remaining,
+    failedRewards: failedRewards.size
+  };
+  if (!targetEnabled) {
+    context.report.activity.reason = "target-not-configured";
+    context.report.actions.push({ type: "activity-target", status: "skipped", point: ACTIVITY_TARGET, reason: "not-configured" });
+    return;
+  }
+  if (!complete) {
+    context.report.actions.push({ type: "activity-target", status: "pending", point: ACTIVITY_TARGET, remaining });
+  }
+  if (Number(state.view.navigation?.activityClaimableCount ?? 0) > 0 && remaining.length === 0) {
     context.report.actions.push({ type: "activity-reward", status: "pending", reason: "unknown-tier" });
   }
+}
+
+export async function runPersonalBoss(context) {
+  let state = await readBossState(context.api);
+  let submissions = 0;
+  while (submissions < BOSS_SUBMISSION_LIMIT) {
+    const freeBefore = personalBossFreeRemaining(state);
+    if (freeBefore === undefined) {
+      context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "unknown-free-pool" });
+      return;
+    }
+    if (freeBefore <= 0) {
+      context.report.actions.push({ type: "personal-boss", status: "no-free-attempt" });
+      return;
+    }
+
+    const candidate = await selectBossCandidate(context, state);
+    if (!candidate) {
+      context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "no-eligible-candidate" });
+      return;
+    }
+    const action = bossAction(candidate, context.options.dryRun ? "planned" : undefined);
+    if (context.options.dryRun) {
+      context.report.actions.push(action);
+      return;
+    }
+
+    const bossCountBefore = finiteCounter(state.bootstrap.daily?.bossCount);
+    let result;
+    let ambiguous = false;
+    try {
+      result = dataOf(await context.api.post("/api/boss/challenge", candidate.body));
+    } catch (error) {
+      if (!error.ambiguous) throw error;
+      ambiguous = true;
+    }
+    submissions += 1;
+    state = await readBossState(context.api);
+    const freeAfter = personalBossFreeRemaining(state);
+    const bossCountAfter = finiteCounter(state.bootstrap.daily?.bossCount);
+    const outcome = reconcileBossChallenge({ result, ambiguous, freeBefore, freeAfter, bossCountBefore, bossCountAfter });
+    context.report.actions.push({ ...action, status: outcome.status });
+    if (!outcome.continue) {
+      context.report.actions.push({ type: "personal-boss", status: "stopped", reason: outcome.reason });
+      return;
+    }
+  }
+  context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "submission-limit", submissions });
+}
+
+async function selectBossCandidate(context, state) {
+  for (const layer of personalBossPreviewLayers(state.view.bosses, state.equipment)) {
+    const previews = [];
+    for (const buffKey of layer.buffKeys) {
+      const body = { ...layer.body, buffKey };
+      try {
+        const preview = await bossPreview(context.api, body);
+        previews.push({ buffKey, body, preview });
+      } catch (error) {
+        context.report.warnings ??= [];
+        context.report.warnings.push(`boss preview skipped: ${safeError(error)}`);
+      }
+    }
+    const selected = chooseBossPreview(previews, BOSS_MINIMUM_CHANCE);
+    if (selected) return { ...layer, ...selected };
+  }
+  return undefined;
+}
+
+async function bossPreview(api, body) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return dataOf(await api.post("/api/boss/preview", body));
+    } catch (error) {
+      const retriable = !error.status || error.status === 409 || error.status === 429 || error.status >= 500;
+      if (!retriable || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+    }
+  }
+}
+
+function reconcileBossChallenge({ result, ambiguous, freeBefore, freeAfter, bossCountBefore, bossCountAfter }) {
+  if (!Number.isFinite(freeAfter) || freeAfter > freeBefore || freeBefore - freeAfter > 1) {
+    return { status: "uncertain", continue: false, reason: "free-pool-conflict" };
+  }
+  const won = result?.battle?.win;
+  if (!ambiguous && won === true && freeAfter === freeBefore - 1) return { status: "won", continue: true };
+  if (!ambiguous && won === false && freeAfter === freeBefore
+    && bossCountAfter !== undefined && bossCountBefore !== undefined && bossCountAfter > bossCountBefore) {
+    return { status: "lost-free-returned", continue: true };
+  }
+  if (ambiguous && freeAfter === freeBefore - 1) return { status: "reconciled-win", continue: true };
+  if (ambiguous && freeAfter === freeBefore && bossCountAfter !== undefined && bossCountBefore !== undefined && bossCountAfter > bossCountBefore) {
+    return { status: "reconciled-loss", continue: true };
+  }
+  return { status: "uncertain", continue: false, reason: "challenge-outcome-unknown" };
+}
+
+function bossAction(candidate, status) {
+  return {
+    type: "personal-boss",
+    ...(status ? { status } : {}),
+    bossKey: candidate.body.bossKey,
+    difficulty: candidate.body.difficulty,
+    buffKey: candidate.body.buffKey,
+    affixKey: candidate.body.affixKey,
+    ...(candidate.body.targetSlot ? { targetSlot: candidate.body.targetSlot } : {}),
+    chance: Number(candidate.preview.chance),
+    rewardMultiplier: candidate.rewardMultiplier,
+    costGold: Number(candidate.difficulty.goldCost),
+    costMaterial: Number(candidate.difficulty.materialCost)
+  };
+}
+
+function personalBossFreeRemaining(state) {
+  const bootstrap = finiteCounter(state.bootstrap.player?.personalBossAttempts?.freeRemaining);
+  const viewValues = (state.view.bosses ?? [])
+    .filter((boss) => boss?.type === "personal")
+    .map((boss) => finiteCounter(boss.personalAttemptPool?.freeRemaining))
+    .filter((value) => value !== undefined);
+  const view = viewValues.length > 0 && viewValues.every((value) => value === viewValues[0]) ? viewValues[0] : undefined;
+  if (bootstrap !== undefined && view !== undefined && bootstrap !== view) return undefined;
+  return bootstrap ?? view;
+}
+
+function finiteCounter(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : undefined;
 }
 
 async function runArcade(context) {
@@ -504,47 +949,78 @@ function explicitValues(value, key, found = []) {
   return found;
 }
 
-export function nextDailyAction(state, knownActivityPoints) {
-  const { bootstrap, view } = state;
+export function nextDailyAction(state, knownActivityPoints, failedRewards = new Set()) {
+  const { bootstrap, view, guild } = state;
   const day = bootstrap.daily?.key;
   const signIn = bootstrap.retention?.signIn ?? {};
-  if (day && signIn.lastClaimedKey !== day && !(signIn.claimedKeys ?? []).includes(day)) {
+  if (day && signIn.lastClaimedKey !== day && !(signIn.claimedKeys ?? []).includes(day) && !failedRewards.has(dailyRewardIdentity("sign-in", day))) {
     return { type: "sign-in", path: "/api/retention/sign-in", body: {} };
   }
-  const quest = (view.quests ?? []).find((entry) => entry.available === true && entry.completed === true && entry.claimed !== true);
+  const quest = (view.quests ?? []).find((entry) => validRewardKey(entry?.key) && entry.available === true && entry.completed === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("quest-reward", entry.key)));
   if (quest) return { type: "quest-reward", path: "/api/quests/claim", body: { questKey: quest.key }, identity: quest.key };
-  const achievement = (view.achievements ?? []).find((entry) => entry.unlocked === true && entry.claimed !== true);
+  const achievement = (view.achievements ?? []).find((entry) => validRewardKey(entry?.key) && entry.unlocked === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("achievement-reward", entry.key)));
   if (achievement) return { type: "achievement-reward", path: "/api/achievements/claim", body: { achievementKey: achievement.key }, identity: achievement.key };
-  const codex = (view.codex?.rewards ?? []).find((entry) => entry.unlocked === true && entry.claimed !== true);
+  const codex = (view.codex?.rewards ?? []).find((entry) => validRewardKey(entry?.key) && entry.unlocked === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("codex-reward", entry.key)));
   if (codex) return { type: "codex-reward", path: "/api/codex/claim", body: { rewardKey: codex.key }, identity: codex.key };
-  const season = (view.rankingSeason?.rewards ?? []).find((entry) => entry.unlocked === true && entry.claimed !== true);
+  const season = (view.rankingSeason?.rewards ?? []).find((entry) => validRewardKey(entry?.key) && entry.unlocked === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("season-reward", entry.key)));
   if (season) return { type: "season-reward", path: "/api/ranking/season/claim", body: { rewardKey: season.key }, identity: season.key };
-  const claimed = new Set(bootstrap.daily?.claimedActivity ?? []);
-  if (Number(view.navigation?.activityClaimableCount ?? 0) > 0) {
-    const point = knownActivityPoints.find((candidate) => !claimed.has(candidate));
+  const guildReward = guild?.joined === true && (guild.progressRewards ?? []).find((entry) => {
+    return Number.isInteger(entry?.point) && entry.point > 0
+      && entry.canClaim === true
+      && entry.claimed !== true
+      && !failedRewards.has(dailyRewardIdentity("guild-progress-reward", entry.point));
+  });
+  if (guildReward) return { type: "guild-progress-reward", path: "/api/guild/claim-progress", body: { point: guildReward.point }, point: guildReward.point };
+  const claimedActivity = bootstrap.daily?.claimedActivity;
+  if (Array.isArray(claimedActivity)) {
+    const claimed = new Set(claimedActivity);
+    const point = knownActivityPoints.find((candidate) => !claimed.has(candidate) && !failedRewards.has(dailyRewardIdentity("activity-reward", candidate)));
     if (point !== undefined) return { type: "activity-reward", path: "/api/daily/claim", body: { point }, point };
   }
   const claimedMail = new Set(bootstrap.claimedMailRewardIds ?? []);
-  const mail = (bootstrap.mails ?? []).find((entry) => entry.claimed !== true && !claimedMail.has(entry.id) && hasMailReward(entry.reward));
+  const mail = (bootstrap.mails ?? []).find((entry) => validRewardKey(entry?.id) && entry.claimed !== true && !claimedMail.has(entry.id) && hasMailReward(entry.reward) && !failedRewards.has(dailyRewardIdentity("mail-attachment", entry.id)));
   if (mail) return { type: "mail-attachment", path: "/api/mail/claim", body: { mailId: mail.id }, identity: mail.id };
   return undefined;
 }
 
-function dailyActionStillPending(state, action) {
+function dailyActionOutcome(state, action) {
   const { bootstrap, view } = state;
   if (action.type === "sign-in") {
     const day = bootstrap.daily?.key;
-    const signIn = bootstrap.retention?.signIn ?? {};
-    return Boolean(day && signIn.lastClaimedKey !== day && !(signIn.claimedKeys ?? []).includes(day));
+    const signIn = bootstrap.retention?.signIn;
+    if (!day || !signIn || typeof signIn !== "object") return "unknown";
+    return signIn.lastClaimedKey === day || (signIn.claimedKeys ?? []).includes(day) ? "claimed" : "pending";
   }
-  if (action.type === "quest-reward") return view.quests?.some((entry) => entry.key === action.identity && entry.available && entry.completed && !entry.claimed);
-  if (action.type === "achievement-reward") return view.achievements?.some((entry) => entry.key === action.identity && entry.unlocked && !entry.claimed);
-  if (action.type === "codex-reward") return view.codex?.rewards?.some((entry) => entry.key === action.identity && entry.unlocked && !entry.claimed);
-  if (action.type === "season-reward") return view.rankingSeason?.rewards?.some((entry) => entry.key === action.identity && entry.unlocked && !entry.claimed);
-  if (action.type === "activity-reward") return !(bootstrap.daily?.claimedActivity ?? []).includes(action.point);
-  if (action.type === "mail-attachment") return (bootstrap.mails ?? []).some((entry) => entry.id === action.identity && !entry.claimed)
-    && !(bootstrap.claimedMailRewardIds ?? []).includes(action.identity);
-  return true;
+  if (action.type === "quest-reward") return collectionRewardOutcome(view.quests, action.identity, (entry) => entry.available === true && entry.completed === true);
+  if (action.type === "achievement-reward") return collectionRewardOutcome(view.achievements, action.identity, (entry) => entry.unlocked === true);
+  if (action.type === "codex-reward") return collectionRewardOutcome(view.codex?.rewards, action.identity, (entry) => entry.unlocked === true);
+  if (action.type === "season-reward") return collectionRewardOutcome(view.rankingSeason?.rewards, action.identity, (entry) => entry.unlocked === true);
+  if (action.type === "guild-progress-reward") {
+    if (!Array.isArray(state.guild?.progressRewards)) return "unknown";
+    const entry = state.guild.progressRewards.find((candidate) => candidate?.point === action.point);
+    return entry?.canClaim === true && entry.claimed !== true ? "pending" : "claimed";
+  }
+  if (action.type === "activity-reward") {
+    if (!Array.isArray(bootstrap.daily?.claimedActivity)) return "unknown";
+    return bootstrap.daily.claimedActivity.includes(action.point) ? "claimed" : "pending";
+  }
+  if (action.type === "mail-attachment") {
+    if (!Array.isArray(bootstrap.mails) || !Array.isArray(bootstrap.claimedMailRewardIds)) return "unknown";
+    if (bootstrap.claimedMailRewardIds.includes(action.identity)) return "claimed";
+    const entry = bootstrap.mails.find((candidate) => candidate?.id === action.identity);
+    return entry?.claimed === false ? "pending" : "claimed";
+  }
+  return "unknown";
+}
+
+function collectionRewardOutcome(collection, identity, eligible) {
+  if (!Array.isArray(collection)) return "unknown";
+  const entry = collection.find((candidate) => candidate?.key === identity);
+  return entry && eligible(entry) && entry.claimed !== true ? "pending" : "claimed";
+}
+
+function validRewardKey(value) {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function pretendDailyClaimed(state, action) {
@@ -554,10 +1030,12 @@ function pretendDailyClaimed(state, action) {
   else if (action.type === "achievement-reward") clone.view.achievements.find((entry) => entry.key === action.identity).claimed = true;
   else if (action.type === "codex-reward") clone.view.codex.rewards.find((entry) => entry.key === action.identity).claimed = true;
   else if (action.type === "season-reward") clone.view.rankingSeason.rewards.find((entry) => entry.key === action.identity).claimed = true;
+  else if (action.type === "guild-progress-reward") clone.guild.progressRewards.find((entry) => entry.point === action.point).claimed = true;
   else if (action.type === "activity-reward") {
     clone.bootstrap.daily.claimedActivity ??= [];
     clone.bootstrap.daily.claimedActivity.push(action.point);
-    clone.view.navigation.activityClaimableCount = Math.max(0, Number(clone.view.navigation.activityClaimableCount) - 1);
+    clone.view.navigation ??= {};
+    clone.view.navigation.activityClaimableCount = Math.max(0, Number(clone.view.navigation.activityClaimableCount ?? 0) - 1);
   } else if (action.type === "mail-attachment") clone.bootstrap.mails.find((entry) => entry.id === action.identity).claimed = true;
   return clone;
 }
@@ -579,8 +1057,33 @@ async function readIdleState(api) {
 }
 
 async function readDailyState(api) {
-  const [bootstrap, view] = await Promise.all([api.get("/api/client/bootstrap"), api.get("/api/client/dynamic-view")]);
-  return { bootstrap: dataOf(bootstrap), view: dataOf(view) };
+  const guildRequest = api.get("/api/guild/view")
+    .then((payload) => dataOf(payload))
+    .catch((error) => ({ unavailable: true, reason: safeError(error) }));
+  const [bootstrap, view, guild] = await Promise.all([
+    api.get("/api/client/bootstrap"),
+    api.get("/api/client/dynamic-view"),
+    guildRequest
+  ]);
+  return { bootstrap: dataOf(bootstrap), view: dataOf(view), guild };
+}
+
+async function readEquipment(api) {
+  const data = dataOf(await api.get("/api/equipment/list"));
+  return Array.isArray(data) ? data : data?.equipment ?? [];
+}
+
+async function readBossState(api) {
+  const [bootstrap, view, equipment] = await Promise.all([
+    api.get("/api/client/bootstrap"),
+    api.get("/api/client/dynamic-view"),
+    readEquipment(api)
+  ]);
+  return {
+    bootstrap: dataOf(bootstrap),
+    view: dataOf(view),
+    equipment
+  };
 }
 
 async function readArcadeState(api) {
@@ -647,12 +1150,72 @@ function hasMailReward(reward) {
   return Object.entries(reward).some(([key, value]) => key !== "items" && Number(value) > 0);
 }
 
+function dailyActionIdentity(action, state) {
+  if (action.identity !== undefined) return dailyRewardIdentity(action.type, action.identity);
+  if (action.point !== undefined) return dailyRewardIdentity(action.type, action.point);
+  if (action.type === "sign-in") return dailyRewardIdentity("sign-in", state.bootstrap.daily?.key ?? "unknown");
+  return dailyRewardIdentity(action.type);
+}
+
+function dailyRewardIdentity(type, identity) {
+  return identity === undefined ? type : `${type}:${identity}`;
+}
+
+function dailyActionReport(action, status) {
+  return {
+    type: action.type,
+    status,
+    ...(action.point !== undefined ? { point: action.point } : {}),
+    ...(action.identity !== undefined ? { identity: action.identity } : {})
+  };
+}
+
+function activityTierClaimed(state, point) {
+  return Array.isArray(state.bootstrap.daily?.claimedActivity)
+    && state.bootstrap.daily.claimedActivity.includes(point);
+}
+
+function activityStateKnown(state) {
+  return Array.isArray(state.bootstrap.daily?.claimedActivity);
+}
+
+function activityPursuitBlocked(failedRewards, activitySafety) {
+  return activitySafety.blocked || failedRewards.has(DAILY_REWARD_LIMIT_IDENTITY);
+}
+
+function allowActivityRewardRetry(failedRewards) {
+  for (const identity of failedRewards) {
+    if (identity.startsWith("activity-reward:")) failedRewards.delete(identity);
+  }
+}
+
+function safeDecompositionPreview(preview, equipmentId) {
+  return Number(preview?.equipmentCount) === 1
+    && Array.isArray(preview?.equipmentIds)
+    && preview.equipmentIds.length === 1
+    && preview.equipmentIds[0] === equipmentId;
+}
+
+function transientRequestFailure(error) {
+  return error?.ambiguous === true
+    || !Number.isFinite(Number(error?.status))
+    || error.status === 409
+    || error.status === 429
+    || error.status >= 500;
+}
+
+function counterIncreased(before, after) {
+  const previous = finiteCounter(before);
+  const next = finiteCounter(after);
+  return previous !== undefined && next !== undefined && next > previous;
+}
+
 function assertNodeVersion() {
   const major = Number(process.versions.node.split(".", 1)[0]);
   if (!Number.isInteger(major) || major < 24) throw new Error("Node.js 24 or newer is required");
 }
 
-function applyDefaults(config) {
+export function applyDefaults(config) {
   const automation = config.automation ?? {};
   return {
     ...config,
@@ -666,12 +1229,22 @@ function applyDefaults(config) {
         urgentLeadMinutes: automation.idle?.urgentLeadMinutes ?? 30
       },
       arcade: { treasureSafeCards: automation.arcade?.treasureSafeCards ?? 2 },
-      daily: { activityRewardPoints: automation.daily?.activityRewardPoints ?? [20] }
+      daily: {
+        activityRewardPoints: automation.daily?.activityRewardPoints ?? KNOWN_ACTIVITY_POINTS,
+        marketMaxGold: automation.daily?.marketMaxGold ?? 300,
+        decomposition: {
+          qualities: (automation.daily?.decomposition?.qualities ?? ["white", "green", "blue"])
+            .map((quality) => QUALITY_ALIASES[String(quality).toLowerCase()] ?? quality),
+          minLevel: automation.daily?.decomposition?.minLevel,
+          maxLevel: automation.daily?.decomposition?.maxLevel,
+          protectPremiumAffixes: automation.daily?.decomposition?.protectPremiumAffixes ?? true
+        }
+      }
     }
   };
 }
 
-function validateConfig(config) {
+export function validateConfig(config) {
   if (!Array.isArray(config.accounts) || config.accounts.length === 0) throw new Error("account config contains no accounts");
   const names = new Set();
   for (const [index, account] of config.accounts.entries()) {
@@ -688,9 +1261,24 @@ function validateConfig(config) {
   if (!Number.isInteger(config.automation.logRetentionDays) || config.automation.logRetentionDays < 1) throw new Error("logRetentionDays must be a positive integer");
   if (Number(config.automation.arcade.treasureSafeCards) < 1) throw new Error("treasureSafeCards must be at least 1");
   const points = config.automation.daily.activityRewardPoints;
-  if (!Array.isArray(points) || points.some((point) => !Number.isInteger(point) || point < 1)) {
-    throw new Error("activityRewardPoints must be an array of positive integers");
+  if (!Array.isArray(points) || points.length === 0 || points.some((point) => !KNOWN_ACTIVITY_POINTS.includes(point)) || new Set(points).size !== points.length) {
+    throw new Error(`activityRewardPoints must contain unique known tiers: ${KNOWN_ACTIVITY_POINTS.join(", ")}`);
   }
+  const marketMaxGold = config.automation.daily.marketMaxGold;
+  if (!Number.isInteger(marketMaxGold) || marketMaxGold < 0) throw new Error("marketMaxGold must be a non-negative integer");
+  const decomposition = config.automation.daily.decomposition;
+  if (!Array.isArray(decomposition.qualities) || decomposition.qualities.length === 0 || decomposition.qualities.some((quality) => !QUALITY_KEYS.has(quality))) {
+    throw new Error("decomposition qualities contain an unknown quality");
+  }
+  for (const key of ["minLevel", "maxLevel"]) {
+    if (decomposition[key] !== undefined && (!Number.isInteger(decomposition[key]) || decomposition[key] < 1)) {
+      throw new Error(`decomposition ${key} must be a positive integer`);
+    }
+  }
+  if (decomposition.minLevel !== undefined && decomposition.maxLevel !== undefined && decomposition.minLevel > decomposition.maxLevel) {
+    throw new Error("decomposition minLevel must not exceed maxLevel");
+  }
+  if (typeof decomposition.protectPremiumAffixes !== "boolean") throw new Error("protectPremiumAffixes must be boolean");
 }
 
 function selectAccounts(accounts, requested) {
@@ -919,7 +1507,7 @@ function formatReports(reports) {
 }
 
 function printHelp() {
-  console.log(`PlaceGame daily automation\n\nUsage:\n  node placegame-auto.mjs [run|status|idle|daily|arcade] [options]\n\nOptions:\n  --config <path>   Account config (default: .placegame-accounts.local.json)\n  --state <path>    Private Session/action state\n  --log-dir <path>  Redacted JSONL report directory\n  --account <alias> Run one configured account\n  --dry-run         Read state and report planned mutations\n  --json            Print structured output\n  --help            Show this help`);
+  console.log(`PlaceGame daily automation\n\nUsage:\n  node placegame-auto.mjs [run|status|idle|daily|arcade|boss] [options]\n\nOptions:\n  --config <path>   Account config (default: .placegame-accounts.local.json)\n  --state <path>    Private Session/action state\n  --log-dir <path>  Redacted JSONL report directory\n  --account <alias> Run one configured account\n  --dry-run         Read state and report planned mutations\n  --json            Print structured output\n  --help            Show this help`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
