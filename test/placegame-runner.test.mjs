@@ -10,6 +10,7 @@ import {
   createProgressReporter,
   main,
   nextDailyAction,
+  runBestEquipment,
   runDaily,
   runPersonalBoss,
   validateConfig
@@ -159,11 +160,13 @@ test("run reports all phases in order", async (t) => {
     "--log-dir", path.join(directory, "logs")
   ], { fetchImpl: createStatusFetch(), outputWrite: (line) => lines.push(line) }), 0);
 
-  assert.deepEqual(lines.slice(4, 12).map(withoutDuration), [
+  assert.deepEqual(lines.slice(4, 14).map(withoutDuration), [
     "[1/1] test: idle and map...",
     "[1/1] test: idle and map done (DURATION, 2 results)",
     "[1/1] test: free arcade...",
     "[1/1] test: free arcade done (DURATION, 4 results)",
+    "[1/1] test: best equipment...",
+    "[1/1] test: best equipment done (DURATION, 0 results)",
     "[1/1] test: personal boss...",
     "[1/1] test: personal boss done (DURATION, 1 result)",
     "[1/1] test: daily rewards...",
@@ -319,6 +322,171 @@ test("personal boss dry run previews the best candidate without challenging", as
     costGold: 100,
     costMaterial: 2
   }]);
+});
+
+test("best equipment wears strict upgrades one slot at a time", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "weapon-current", status: "equipped", slot: "weapon", score: 10 }),
+    dailyEquipment({ id: "weapon-best", slot: "weapon", score: 30 }),
+    dailyEquipment({ id: "armor-current", status: "equipped", slot: "armor", score: 20 }),
+    dailyEquipment({ id: "armor-best", slot: "armor", score: 25 }),
+    dailyEquipment({ id: "armor-equal", slot: "armor", score: 20 })
+  ]);
+  const context = equipmentContext(api);
+
+  const result = await runBestEquipment(context);
+
+  assert.deepEqual(api.posts.map((entry) => entry.body), [
+    { equipmentId: "armor-best" },
+    { equipmentId: "weapon-best" }
+  ]);
+  assert.deepEqual(context.report.actions, [
+    { type: "equipment-wear", status: "completed", slot: "armor", fromScore: 20, toScore: 25 },
+    { type: "equipment-wear", status: "completed", slot: "weapon", fromScore: 10, toScore: 30 }
+  ]);
+  assert.equal(result.safeForDecomposition, true);
+  assert.equal(result.equipment.find((item) => item.id === "weapon-best").status, "equipped");
+});
+
+test("best equipment continues later slots after an earlier authoritative failure", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "armor-current", status: "equipped", slot: "armor", score: 20 }),
+    dailyEquipment({ id: "armor-best", slot: "armor", score: 25 }),
+    dailyEquipment({ id: "weapon-current", status: "equipped", slot: "weapon", score: 10 }),
+    dailyEquipment({ id: "weapon-best", slot: "weapon", score: 30 })
+  ], {
+    failedIds: new Set(["armor-best"])
+  });
+  const context = equipmentContext(api);
+
+  const result = await runBestEquipment(context);
+
+  assert.equal(api.posts.length, 2);
+  assert.deepEqual(context.report.actions.map((entry) => [entry.slot, entry.status]), [
+    ["armor", "failed"],
+    ["weapon", "completed"]
+  ]);
+  assert.equal(result.safeForDecomposition, false);
+  assert.equal(result.equipment.find((item) => item.id === "weapon-best").status, "equipped");
+});
+
+test("best equipment marks unchanged wear uncertain and continues", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "armor-current", status: "equipped", slot: "armor", score: 20 }),
+    dailyEquipment({ id: "armor-best", slot: "armor", score: 25 }),
+    dailyEquipment({ id: "weapon-current", status: "equipped", slot: "weapon", score: 10 }),
+    dailyEquipment({ id: "weapon-best", slot: "weapon", score: 30 })
+  ], { unchangedIds: new Set(["armor-best"]) });
+  const context = equipmentContext(api);
+
+  const result = await runBestEquipment(context);
+
+  assert.deepEqual(context.report.actions.map((entry) => [entry.slot, entry.status]), [
+    ["armor", "uncertain"],
+    ["weapon", "completed"]
+  ]);
+  assert.equal(result.safeForDecomposition, false);
+});
+
+test("best equipment recomputes candidates from refreshed state", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "armor-current", status: "equipped", slot: "armor", score: 20 }),
+    dailyEquipment({ id: "armor-best", slot: "armor", score: 25 }),
+    dailyEquipment({ id: "weapon-current", status: "equipped", slot: "weapon", score: 10 }),
+    dailyEquipment({ id: "weapon-best", slot: "weapon", score: 30 })
+  ], {
+    afterWear(equipment, equipmentId) {
+      if (equipmentId === "armor-best") {
+        equipment.push(dailyEquipment({ id: "weapon-new-best", slot: "weapon", score: 40 }));
+      }
+    }
+  });
+  const context = equipmentContext(api);
+
+  const result = await runBestEquipment(context);
+
+  assert.deepEqual(api.posts.map((entry) => entry.body), [
+    { equipmentId: "armor-best" },
+    { equipmentId: "weapon-new-best" }
+  ]);
+  assert.equal(result.safeForDecomposition, true);
+});
+
+test("best equipment dry run plans upgrades without wearing them", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "weapon-current", status: "equipped", slot: "weapon", score: 10 }),
+    dailyEquipment({ id: "weapon-best", slot: "weapon", score: 30 })
+  ]);
+  const context = equipmentContext(api, { dryRun: true });
+
+  const result = await runBestEquipment(context);
+
+  assert.equal(api.posts.length, 0);
+  assert.deepEqual(context.report.actions, [{
+    type: "equipment-wear",
+    status: "planned",
+    slot: "weapon",
+    fromScore: 10,
+    toScore: 30
+  }]);
+  assert.equal(result.safeForDecomposition, true);
+  assert.equal(result.equipment.find((item) => item.id === "weapon-best").status, "equipped");
+});
+
+test("best equipment rejects a malformed equipment response", async () => {
+  const context = equipmentContext({
+    async get(pathName) {
+      assert.equal(pathName, "/api/equipment/list");
+      return { data: {} };
+    }
+  });
+
+  const result = await runBestEquipment(context);
+
+  assert.deepEqual(result, {
+    safeForDecomposition: false,
+    equipment: undefined,
+    reason: "equipment-state-read-failed"
+  });
+  assert.deepEqual(context.report.actions, [{
+    type: "equipment-wear",
+    status: "failed",
+    reason: "equipment list response was malformed"
+  }]);
+});
+
+test("best equipment marks an unknown equipped score unsafe", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "current", status: "equipped", slot: "weapon", score: undefined }),
+    dailyEquipment({ id: "candidate", slot: "weapon", score: 30 })
+  ]);
+  const context = equipmentContext(api);
+
+  const result = await runBestEquipment(context);
+
+  assert.equal(api.posts.length, 0);
+  assert.equal(result.safeForDecomposition, false);
+  assert.equal(result.reason, "equipped-score-unknown");
+  assert.deepEqual(context.report.actions, [{
+    type: "equipment-wear",
+    status: "stopped",
+    slot: "weapon",
+    reason: "equipped-score-unknown"
+  }]);
+});
+
+test("best equipment marks an unknown candidate score unsafe", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "current", status: "equipped", slot: "weapon", score: 10 }),
+    dailyEquipment({ id: "candidate", slot: "weapon", score: null })
+  ]);
+  const context = equipmentContext(api);
+
+  const result = await runBestEquipment(context);
+
+  assert.equal(api.posts.length, 0);
+  assert.equal(result.safeForDecomposition, false);
+  assert.equal(result.reason, "candidate-score-unknown");
 });
 
 test("personal boss submits the exact previewed challenge body", async () => {
@@ -570,6 +738,82 @@ test("daily activity decomposes one safe item then claims 100 and stops", async 
   assert.deepEqual(api.posts.find((entry) => entry.path === "/api/daily/claim").body, { point: 100 });
   assert.equal(context.report.activity.status, "newly-complete");
   assert.equal(api.equipment.some((item) => item.id === "second"), true);
+});
+
+test("daily wears upgrades before considering replaced equipment for decomposition", async () => {
+  const api = createDailyApi({
+    claimedActivity: [20, 40, 60, 80],
+    equipment: [
+      dailyEquipment({ id: "old", status: "equipped", slot: "weapon", score: 10 }),
+      dailyEquipment({ id: "upgrade", slot: "weapon", score: 20 })
+    ],
+    unlockActivityAfter: "decompose"
+  });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  assert.deepEqual(api.posts.map((entry) => entry.path), [
+    "/api/daily/claim",
+    "/api/equipment/wear",
+    "/api/equipment/decompose-preview",
+    "/api/equipment/decompose",
+    "/api/daily/claim"
+  ]);
+  assert.deepEqual(api.posts[1].body, { equipmentId: "upgrade" });
+  assert.deepEqual(api.posts[3].body, { equipmentIds: ["old"] });
+});
+
+test("daily blocks decomposition and purchase after a wear failure", async () => {
+  const api = createDailyApi({
+    claimedActivity: [20, 40, 60, 80],
+    equipment: [
+      dailyEquipment({ id: "current", status: "equipped", slot: "weapon", score: 10 }),
+      dailyEquipment({ id: "upgrade", slot: "weapon", score: 20 }),
+      dailyEquipment({ id: "safe", slot: "armor", score: 5 })
+    ],
+    orders: [{ id: "cheap", orderType: "sell", itemType: "equipment", status: "active", currencyType: "gold", price: 1, amount: 1 }],
+    failPaths: new Set(["/api/equipment/wear:"])
+  });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  assert.equal(api.posts.some((entry) => entry.path === "/api/equipment/decompose"), false);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/market/buy"), false);
+  assert.deepEqual(context.report.actions.find((entry) => entry.type === "equipment-decompose"), {
+    type: "equipment-decompose",
+    status: "stopped",
+    reason: "equipment-wear-failed"
+  });
+});
+
+test("daily wears a reward-dropped upgrade before later decomposition", async () => {
+  const api = createDailyApi({
+    claimedActivity: [20, 40, 60],
+    equipment: [
+      dailyEquipment({ id: "current", status: "equipped", slot: "weapon", score: 10 }),
+      dailyEquipment({ id: "first-safe", score: 1 }),
+      dailyEquipment({ id: "second-safe", score: 2 })
+    ],
+    decomposeUnlockPoints: [80, 100],
+    rewardEquipmentByActivity: {
+      80: dailyEquipment({ id: "reward-upgrade", slot: "weapon", score: 30 })
+    }
+  });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  const decompositionIndexes = api.posts
+    .map((entry, index) => entry.path === "/api/equipment/decompose" ? index : -1)
+    .filter((index) => index >= 0);
+  const wearIndex = api.posts.findIndex((entry) => entry.path === "/api/equipment/wear");
+  assert.equal(decompositionIndexes.length, 2);
+  assert.ok(decompositionIndexes[0] < wearIndex && wearIndex < decompositionIndexes[1]);
+  assert.deepEqual(api.posts[wearIndex].body, { equipmentId: "reward-upgrade" });
+  assert.notDeepEqual(api.posts[decompositionIndexes[1]].body, { equipmentIds: ["reward-upgrade"] });
+  assert.equal(api.equipment.find((item) => item.id === "reward-upgrade").status, "equipped");
 });
 
 test("daily activity buys at most one cheapest unit after decomposition is exhausted", async () => {
@@ -853,6 +1097,41 @@ function bossContext(api, options = {}) {
   };
 }
 
+function equipmentContext(api, options = {}) {
+  return {
+    api,
+    options: { dryRun: false, ...options },
+    report: { actions: [] }
+  };
+}
+
+function createEquipmentApi(equipment, {
+  ambiguousIds = new Set(),
+  failedIds = new Set(),
+  unchangedIds = new Set(),
+  afterWear
+} = {}) {
+  return {
+    equipment: structuredClone(equipment),
+    posts: [],
+    async get(pathName) {
+      if (pathName === "/api/equipment/list") return { data: structuredClone(this.equipment) };
+      assert.fail(`unexpected GET ${pathName}`);
+    },
+    async post(pathName, body) {
+      assert.equal(pathName, "/api/equipment/wear");
+      this.posts.push({ path: pathName, body: structuredClone(body) });
+      if (failedIds.has(body.equipmentId)) throw new Error("wear rejected");
+      if (!unchangedIds.has(body.equipmentId)) wearEquipment(this.equipment, body.equipmentId);
+      afterWear?.(this.equipment, body.equipmentId);
+      if (ambiguousIds.has(body.equipmentId)) {
+        throw Object.assign(new Error("lost response"), { ambiguous: true });
+      }
+      return { data: {} };
+    }
+  };
+}
+
 function createBossApi({ freeRemaining, challengeResult, ambiguousChallenge = false, consumeFree = false, recordBossAttempt = true }) {
   let remaining = freeRemaining;
   let bossCount = 0;
@@ -940,9 +1219,14 @@ function createDailyApi({
   ambiguousWithoutMutation = new Set(),
   failGuildRead = false,
   omitAfterClaim = new Set(),
-  failDecomposePreviews = false
+  failDecomposePreviews = false,
+  decomposeUnlockPoints,
+  rewardEquipmentByActivity = {}
 } = {}) {
   const claimablePoints = new Set(claimableActivity);
+  const pendingDecomposeUnlocks = Array.isArray(decomposeUnlockPoints)
+    ? [...decomposeUnlockPoints]
+    : unlockActivityAfter === "decompose" ? [100] : [];
   const state = {
     bootstrap: {
       player: { gold: 10_000 },
@@ -994,6 +1278,8 @@ function createDailyApi({
         state.view.achievements.find((entry) => entry.key === body.achievementKey).claimed = true;
       } else if (pathName === "/api/guild/claim-progress") {
         state.guild.progressRewards.find((entry) => entry.point === body.point).claimed = true;
+      } else if (pathName === "/api/equipment/wear") {
+        wearEquipment(this.equipment, body.equipmentId);
       } else if (pathName === "/api/equipment/decompose-preview") {
         if (failDecomposePreviews) throw new Error("preview unavailable");
         return { data: { equipmentIds: [...body.equipmentIds], equipmentCount: body.equipmentIds.length, goldGain: 1, materials: [] } };
@@ -1001,9 +1287,10 @@ function createDailyApi({
         if (!skipMutation) {
           state.bootstrap.daily.decomposeCount += 1;
           this.equipment = this.equipment.filter((entry) => !body.equipmentIds.includes(entry.id));
-          if (unlockActivityAfter === "decompose") {
+          const unlockedPoint = pendingDecomposeUnlocks.shift();
+          if (unlockedPoint !== undefined) {
             state.view.navigation.activityClaimableCount = 1;
-            claimablePoints.add(100);
+            claimablePoints.add(unlockedPoint);
           }
         }
       } else if (pathName === "/api/market/buy") {
@@ -1022,6 +1309,8 @@ function createDailyApi({
           state.bootstrap.daily.claimedActivity.push(body.point);
           claimablePoints.delete(body.point);
           state.view.navigation.activityClaimableCount = Math.max(0, state.view.navigation.activityClaimableCount - 1);
+          const rewardEquipment = rewardEquipmentByActivity[body.point];
+          if (rewardEquipment) this.equipment.push(structuredClone(rewardEquipment));
         }
       } else {
         assert.fail(`unexpected POST ${pathName}`);
@@ -1043,6 +1332,15 @@ function dailyEquipment(overrides = {}) {
     rareRank: "普通装备",
     ...overrides
   };
+}
+
+function wearEquipment(equipment, equipmentId) {
+  const candidate = equipment.find((entry) => entry.id === equipmentId);
+  for (const entry of equipment) {
+    if (entry.slot !== candidate.slot) continue;
+    entry.status = entry.id === candidate.id ? "equipped" : "in_bag";
+    entry.equipped = entry.id === candidate.id;
+  }
 }
 
 function createAccountFailureFetch() {

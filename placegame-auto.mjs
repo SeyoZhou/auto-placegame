@@ -20,13 +20,16 @@ import { ApiError, PlaceGameApi, dataOf } from "./lib/placegame-api.mjs";
 import {
   blackjackDecision,
   chooseAdventure,
+  chooseBestEquipmentUpgrade,
   chooseBossPreview,
   chooseCoinLane,
   chooseLowestChargeMarketOrder,
   chooseSafeDecomposition,
   countProtectedDecomposition,
+  equipmentComparisonIssue,
   effectiveMapRates,
   isIdleDue,
+  isEquipmentWorn,
   personalBossPreviewLayers,
   shouldChangeMap,
   stableJitterSeconds,
@@ -45,6 +48,7 @@ const BOSS_SUBMISSION_LIMIT = 20;
 const KNOWN_ACTIVITY_POINTS = [20, 40, 60, 80, 100];
 const ACTIVITY_TARGET = 100;
 const ACTIVITY_MUTATION_LIMIT = 60;
+const EQUIPMENT_WEAR_LIMIT = 60;
 const DAILY_REWARD_LIMIT_IDENTITY = "daily-rewards:mutation-limit";
 const QUALITY_ALIASES = {
   common: "white",
@@ -144,15 +148,18 @@ async function runCommand(context, progress) {
   } else if (context.options.command === "idle") {
     await runStage(progress, context, "idle and map", runIdle);
   } else if (context.options.command === "daily") {
+    await runStage(progress, context, "best equipment", runBestEquipment);
     await runBestEffortBossStage(progress, context);
     await runStage(progress, context, "daily rewards", runDaily);
   } else if (context.options.command === "arcade") {
     await runStage(progress, context, "free arcade", runArcade);
   } else if (context.options.command === "boss") {
+    await runStage(progress, context, "best equipment", runBestEquipment);
     await runStage(progress, context, "personal boss", runPersonalBoss);
   } else {
     await runStage(progress, context, "idle and map", runIdle);
     await runStage(progress, context, "free arcade", runArcade);
+    await runStage(progress, context, "best equipment", runBestEquipment);
     await runBestEffortBossStage(progress, context);
     await runStage(progress, context, "daily rewards", runDaily);
   }
@@ -340,18 +347,108 @@ export async function runDaily(context) {
   const failedRewards = new Set();
   const activitySafety = { blocked: false };
   state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  const equipmentResult = await runBestEquipment(context);
   if (targetEnabled
     && activityStateKnown(state)
     && !activityTierClaimed(state, ACTIVITY_TARGET)
     && !activityPursuitBlocked(failedRewards, activitySafety)) {
-    state = await pursueActivity(context, state, failedRewards, activitySafety);
+    state = await pursueActivity(context, state, failedRewards, activitySafety, equipmentResult);
   } else if (targetEnabled && !activityTierClaimed(state, ACTIVITY_TARGET) && activityPursuitBlocked(failedRewards, activitySafety)) {
     context.report.actions.push({ type: "activity-target", status: "stopped", reason: "reward-claim-blocked" });
   }
   if (!context.options.dryRun && activityStateKnown(state)) {
     state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+    await runBestEquipment(context);
   }
   reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled);
+}
+
+export async function runBestEquipment(context) {
+  const skippedSlots = new Set();
+  let safeForDecomposition = true;
+  let unsafeReason;
+  let equipment;
+  try {
+    equipment = await readEquipment(context.api);
+  } catch (error) {
+    context.report.actions.push({ type: "equipment-wear", status: "failed", reason: safeError(error) });
+    return { safeForDecomposition: false, equipment: undefined, reason: "equipment-state-read-failed" };
+  }
+  let mutations = 0;
+  while (mutations < EQUIPMENT_WEAR_LIMIT) {
+    const upgrade = chooseBestEquipmentUpgrade(equipment, skippedSlots);
+    if (!upgrade) {
+      const issue = equipmentComparisonIssue(equipment);
+      if (issue) {
+        context.report.actions.push({ type: "equipment-wear", status: "stopped", ...issue });
+        return { safeForDecomposition: false, equipment, reason: issue.reason };
+      }
+      return { safeForDecomposition, equipment, reason: unsafeReason };
+    }
+    const action = {
+      type: "equipment-wear",
+      slot: upgrade.slot,
+      fromScore: upgrade.currentScore,
+      toScore: upgrade.candidateScore
+    };
+    if (context.options.dryRun) {
+      context.report.actions.push({ ...action, status: "planned" });
+      equipment = simulateEquipmentWear(equipment, upgrade);
+      mutations += 1;
+      continue;
+    }
+
+    let ambiguous = false;
+    try {
+      await context.api.post("/api/equipment/wear", { equipmentId: upgrade.candidate.id });
+    } catch (error) {
+      if (!error.ambiguous) {
+        context.report.actions.push({ ...action, status: "failed", reason: safeError(error) });
+        safeForDecomposition = false;
+        unsafeReason ??= "equipment-wear-failed";
+        skippedSlots.add(upgrade.slot);
+        continue;
+      }
+      ambiguous = true;
+    }
+    mutations += 1;
+    try {
+      equipment = await readEquipment(context.api);
+    } catch (error) {
+      context.report.actions.push({
+        ...action,
+        status: "uncertain",
+        reason: ambiguous ? "outcome-unknown" : `state-refresh-failed: ${safeError(error)}`
+      });
+      return {
+        safeForDecomposition: false,
+        equipment,
+        reason: ambiguous ? "equipment-wear-outcome-unknown" : "equipment-state-refresh-failed"
+      };
+    }
+    if (!equipment.some((item) => item?.id === upgrade.candidate.id && isEquipmentWorn(item))) {
+      context.report.actions.push({ ...action, status: "uncertain", reason: "state-not-confirmed" });
+      safeForDecomposition = false;
+      unsafeReason ??= "equipment-wear-not-confirmed";
+      skippedSlots.add(upgrade.slot);
+      continue;
+    }
+    context.report.actions.push({ ...action, status: ambiguous ? "reconciled" : "completed" });
+  }
+
+  if (chooseBestEquipmentUpgrade(equipment, skippedSlots)) {
+    context.report.actions.push({ type: "equipment-wear", status: "stopped", reason: "mutation-limit" });
+    return { safeForDecomposition: false, equipment, reason: "equipment-wear-mutation-limit" };
+  }
+  return { safeForDecomposition, equipment, reason: unsafeReason };
+}
+
+function simulateEquipmentWear(equipment, upgrade) {
+  return equipment.map((item) => {
+    if (item?.id === upgrade.candidate.id) return { ...item, status: "equipped", equipped: true };
+    if (item?.id === upgrade.current?.id) return { ...item, status: "in_bag", equipped: false };
+    return item;
+  });
 }
 
 async function claimDailyRewards(context, initialState, failedRewards, activitySafety) {
@@ -425,8 +522,9 @@ async function claimDailyRewards(context, initialState, failedRewards, activityS
   return state;
 }
 
-async function pursueActivity(context, initialState, failedRewards, activitySafety) {
+async function pursueActivity(context, initialState, failedRewards, activitySafety, initialEquipmentResult) {
   let state = initialState;
+  let equipmentResult = initialEquipmentResult;
   const settings = context.config.automation.daily;
   const skippedEquipment = new Set();
   let candidateAttempts = 0;
@@ -435,7 +533,15 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
     && !activityTierClaimed(state, ACTIVITY_TARGET)
     && !activityPursuitBlocked(failedRewards, activitySafety)
     && candidateAttempts < ACTIVITY_MUTATION_LIMIT) {
-    const equipment = await readEquipment(context.api);
+    if (!equipmentResult.safeForDecomposition) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "stopped",
+        reason: equipmentResult.reason ?? "equipment-comparison-unsafe"
+      });
+      return state;
+    }
+    const equipment = equipmentResult.equipment;
     if (context.options.dryRun) {
       const protectedCount = countProtectedDecomposition(equipment, settings.decomposition);
       if (protectedCount > 0) {
@@ -520,6 +626,7 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
     });
     allowActivityRewardRetry(failedRewards);
     state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+    equipmentResult = await runBestEquipment(context);
   }
   if (!activityStateKnown(state)) {
     context.report.actions.push({ type: "activity-target", status: "stopped", reason: "unknown-activity-state" });
@@ -532,6 +639,14 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
   if (activityTierClaimed(state, ACTIVITY_TARGET)) return state;
   if (candidateAttempts >= ACTIVITY_MUTATION_LIMIT) {
     context.report.actions.push({ type: "equipment-decompose", status: "stopped", reason: "candidate-limit" });
+    return state;
+  }
+  if (!equipmentResult.safeForDecomposition) {
+    context.report.actions.push({
+      type: "equipment-decompose",
+      status: "stopped",
+      reason: equipmentResult.reason ?? "equipment-comparison-unsafe"
+    });
     return state;
   }
   return purchaseActivityItem(context, state, failedRewards, activitySafety);
@@ -1070,7 +1185,9 @@ async function readDailyState(api) {
 
 async function readEquipment(api) {
   const data = dataOf(await api.get("/api/equipment/list"));
-  return Array.isArray(data) ? data : data?.equipment ?? [];
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.equipment)) return data.equipment;
+  throw new Error("equipment list response was malformed");
 }
 
 async function readBossState(api) {

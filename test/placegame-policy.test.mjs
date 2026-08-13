@@ -6,10 +6,12 @@ import {
   chooseAdventure,
   chooseBestMap,
   chooseBossPreview,
+  chooseBestEquipmentUpgrade,
   chooseCoinLane,
   chooseLowestChargeMarketOrder,
   chooseSafeDecomposition,
   countProtectedDecomposition,
+  equipmentComparisonIssue,
   isIdleDue,
   lowestScoredEquippedSlot,
   personalBossPreviewLayers,
@@ -152,6 +154,74 @@ test("lowest scored target slot is stable and fail closed", () => {
   ];
   assert.equal(lowestScoredEquippedSlot(equipment, ["weapon", "armor", "ring"]), "armor");
   assert.equal(lowestScoredEquippedSlot(equipment, ["ring"]), undefined);
+});
+
+test("best equipment upgrade chooses a strict score increase per slot", () => {
+  const equipment = [
+    equipmentItem({ id: "weapon-current", status: "equipped", slot: "weapon", score: 100 }),
+    equipmentItem({ id: "weapon-lower", slot: "weapon", score: 99 }),
+    equipmentItem({ id: "weapon-best", slot: "weapon", score: 130 }),
+    equipmentItem({ id: "armor-current", status: "equipped", slot: "armor", score: 50 }),
+    equipmentItem({ id: "armor-equal", slot: "armor", score: 50 })
+  ];
+
+  assert.deepEqual(chooseBestEquipmentUpgrade(equipment), {
+    slot: "weapon",
+    current: equipment[0],
+    candidate: equipment[2],
+    currentScore: 100,
+    candidateScore: 130
+  });
+  assert.equal(chooseBestEquipmentUpgrade(equipment, new Set(["weapon"])), undefined);
+});
+
+test("best equipment upgrade fills empty slots and rejects uncertain state", () => {
+  const equipment = [
+    equipmentItem({ id: "boots-low", slot: "boots", score: 10 }),
+    equipmentItem({ id: "boots-best", slot: "boots", score: 20 }),
+    equipmentItem({ id: "ring-current", status: "equipped", slot: "ring", score: undefined }),
+    equipmentItem({ id: "ring-candidate", slot: "ring", score: 100 }),
+    equipmentItem({ id: "listed", status: "listed", slot: "helmet", score: 999 }),
+    equipmentItem({ id: "unknown-score", slot: "armor", score: null })
+  ];
+
+  assert.deepEqual(chooseBestEquipmentUpgrade(equipment), {
+    slot: "boots",
+    current: undefined,
+    candidate: equipment[1],
+    currentScore: undefined,
+    candidateScore: 20
+  });
+  assert.equal(chooseBestEquipmentUpgrade(equipment, new Set(["boots"])), undefined);
+  assert.deepEqual(equipmentComparisonIssue(equipment), {
+    slot: "ring",
+    reason: "equipped-score-unknown"
+  });
+});
+
+test("equipment comparison rejects multiple equipped items when an upgrade is available", () => {
+  const equipment = [
+    equipmentItem({ id: "first-current", status: "equipped", slot: "weapon", score: 10 }),
+    equipmentItem({ id: "second-current", status: "equipped", slot: "weapon", score: 20 }),
+    equipmentItem({ id: "candidate", slot: "weapon", score: 30 })
+  ];
+
+  assert.deepEqual(equipmentComparisonIssue(equipment), {
+    slot: "weapon",
+    reason: "multiple-equipped-items"
+  });
+});
+
+test("equipment comparison rejects a bag candidate with an unknown score", () => {
+  const equipment = [
+    equipmentItem({ id: "current", status: "equipped", slot: "weapon", score: 10 }),
+    equipmentItem({ id: "candidate", slot: "weapon", score: null })
+  ];
+
+  assert.deepEqual(equipmentComparisonIssue(equipment), {
+    slot: "weapon",
+    reason: "candidate-score-unknown"
+  });
 });
 
 test("safe decomposition defaults protect premium, equipped, locked, and higher-quality equipment", () => {
