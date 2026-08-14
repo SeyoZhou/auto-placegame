@@ -37,7 +37,6 @@ import {
 } from "./lib/placegame-policy.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const CLIENT_VERSION = "0.2.36";
 const DEFAULT_CONFIG = path.join(ROOT, ".placegame-accounts.local.json");
 const DEFAULT_STATE = path.join(ROOT, ".placegame-state.local.json");
 const DEFAULT_LOG_DIR = path.join(ROOT, ".placegame-logs");
@@ -94,6 +93,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const state = await loadState(statePath);
   const releaseLock = await acquireLock();
   const reports = [];
+  const clientVersions = new Map();
   const progress = createProgressReporter({
     enabled: !options.json,
     write: dependencies.progressWrite ?? outputWrite,
@@ -107,10 +107,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const alias = account.name || `account-${index + 1}`;
       const report = { alias, command: options.command, dryRun: options.dryRun, startedAt: new Date().toISOString(), actions: [] };
       const accountProgress = progress.account({ alias, current: reports.length + 1, total: selected.length });
+      const server = account.server ?? config.server;
+      let api;
       try {
-        const api = new PlaceGameApi({
-          baseUrl: account.server ?? config.server,
-          version: CLIENT_VERSION,
+        api = new PlaceGameApi({
+          baseUrl: server,
+          version: clientVersions.get(server),
           timeoutMs: config.automation.requestTimeoutMs,
           fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
         });
@@ -124,6 +126,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         report.error = safeError(error);
         exitCode = 1;
       }
+      if (api) clientVersions.set(server, api.version);
       report.finishedAt = new Date().toISOString();
       accountProgress.finish({ ok: report.ok, error: report.error });
       reports.push(report);
@@ -1537,7 +1540,13 @@ function pruneActions(actions) {
 }
 
 function safeError(error) {
-  if (error instanceof ApiError) return `${error.path ?? "request"}: ${error.authentication ? "authentication rejected" : error.ambiguous ? "outcome uncertain after network failure" : "request rejected"}`;
+  if (error instanceof ApiError) {
+    let reason = "request rejected";
+    if (error.authentication) reason = "authentication rejected";
+    else if (error.ambiguous) reason = "outcome uncertain after network failure";
+    else if (error.requiredVersion) reason = `client upgrade failed (server requires ${error.requiredVersion})`;
+    return `${error.path ?? "request"}: ${reason}`;
+  }
   return String(error?.message ?? "unknown error").replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
 }
 

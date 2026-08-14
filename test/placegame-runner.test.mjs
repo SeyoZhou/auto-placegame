@@ -142,6 +142,45 @@ test("main streams progress in human mode and keeps JSON output clean", async (t
   assert.equal(JSON.parse(jsonLines[0]).reports[0].alias, "test");
 });
 
+test("accounts on the same server reuse a negotiated client version", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-version-negotiation-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  await writeFile(configPath, JSON.stringify({ accounts: [
+    { name: "first", username: "first-user", password: "first-password" },
+    { name: "second", username: "second-user", password: "second-password" }
+  ] }));
+  await chmod(configPath, 0o600);
+  const fallback = createStatusFetch();
+  const loginVersions = [];
+  const fetchImpl = async (url, options) => {
+    if (new URL(url).pathname === "/api/auth/login") {
+      const version = options.headers["x-placegame-client-version"];
+      loginVersions.push(version);
+      if (loginVersions.length === 1) {
+        return {
+          ok: false,
+          status: 426,
+          json: async () => ({ ok: false, error: "Upgrade to 0.2.38" })
+        };
+      }
+    }
+    return fallback(url, options);
+  };
+
+  assert.equal(await main([
+    "status",
+    "--config", configPath,
+    "--state", path.join(directory, "state.json"),
+    "--log-dir", path.join(directory, "logs")
+  ], { fetchImpl, outputWrite: () => {} }), 0);
+
+  assert.deepEqual(loginVersions, ["0.2.37", "0.2.38", "0.2.38"]);
+});
+
 test("run reports all phases in order", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "placegame-run-progress-test-"));
   t.after(async () => {
@@ -233,6 +272,32 @@ test("one account failure reports progress and continues with the next account",
   assert.doesNotMatch(lines.join("\n"), /fail-user|fail-password|ok-user|ok-password/);
   assert.match(lines.at(-1), /^\nSummary\nfirst: error/);
   assert.match(lines.at(-1), /second: ok/);
+});
+
+test("version negotiation failure reports the server requirement", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-version-failure-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  await writeFile(configPath, '{"accounts":[{"name":"test","username":"u","password":"p"}]}\n');
+  await chmod(configPath, 0o600);
+  const lines = [];
+  const fetchImpl = async () => ({
+    ok: false,
+    status: 426,
+    json: async () => ({ ok: false, error: "Upgrade to 0.2.37" })
+  });
+
+  assert.equal(await main([
+    "status",
+    "--config", configPath,
+    "--state", path.join(directory, "state.json"),
+    "--log-dir", path.join(directory, "logs")
+  ], { fetchImpl, outputWrite: (line) => lines.push(line) }), 1);
+
+  assert.match(lines.join("\n"), /client upgrade failed \(server requires 0\.2\.37\)/);
 });
 
 test("daily claims require available completed quests", () => {
