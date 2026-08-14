@@ -24,13 +24,13 @@ import {
   chooseBossPreview,
   chooseCoinLane,
   chooseLowestChargeMarketOrder,
-  chooseSafeDecomposition,
   countProtectedDecomposition,
   equipmentComparisonIssue,
   effectiveMapRates,
   isIdleDue,
   isEquipmentWorn,
   personalBossPreviewLayers,
+  safeDecompositionCandidates,
   shouldChangeMap,
   stableJitterSeconds,
   stableKey
@@ -48,6 +48,7 @@ const KNOWN_ACTIVITY_POINTS = [20, 40, 60, 80, 100];
 const ACTIVITY_TARGET = 100;
 const ACTIVITY_MUTATION_LIMIT = 60;
 const EQUIPMENT_WEAR_LIMIT = 60;
+const DECOMPOSITION_BATCH_SIZE = 50;
 const DAILY_REWARD_LIMIT_IDENTITY = "daily-rewards:mutation-limit";
 const QUALITY_ALIASES = {
   common: "white",
@@ -351,14 +352,14 @@ export async function runDaily(context) {
   const activitySafety = { blocked: false };
   state = await claimDailyRewards(context, state, failedRewards, activitySafety);
   const equipmentResult = await runBestEquipment(context);
-  if (targetEnabled
-    && activityStateKnown(state)
-    && !activityTierClaimed(state, ACTIVITY_TARGET)
-    && !activityPursuitBlocked(failedRewards, activitySafety)) {
-    state = await pursueActivity(context, state, failedRewards, activitySafety, equipmentResult);
-  } else if (targetEnabled && !activityTierClaimed(state, ACTIVITY_TARGET) && activityPursuitBlocked(failedRewards, activitySafety)) {
-    context.report.actions.push({ type: "activity-target", status: "stopped", reason: "reward-claim-blocked" });
-  }
+  state = await cleanEquipmentAndPursueActivity(
+    context,
+    state,
+    failedRewards,
+    activitySafety,
+    equipmentResult,
+    targetEnabled
+  );
   if (!context.options.dryRun && activityStateKnown(state)) {
     state = await claimDailyRewards(context, state, failedRewards, activitySafety);
     await runBestEquipment(context);
@@ -525,17 +526,31 @@ async function claimDailyRewards(context, initialState, failedRewards, activityS
   return state;
 }
 
-async function pursueActivity(context, initialState, failedRewards, activitySafety, initialEquipmentResult) {
+async function cleanEquipmentAndPursueActivity(
+  context,
+  initialState,
+  failedRewards,
+  activitySafety,
+  initialEquipmentResult,
+  targetEnabled
+) {
   let state = initialState;
   let equipmentResult = initialEquipmentResult;
   const settings = context.config.automation.daily;
   const skippedEquipment = new Set();
-  let candidateAttempts = 0;
   let consecutivePreviewFailures = 0;
-  while (activityStateKnown(state)
-    && !activityTierClaimed(state, ACTIVITY_TARGET)
-    && !activityPursuitBlocked(failedRewards, activitySafety)
-    && candidateAttempts < ACTIVITY_MUTATION_LIMIT) {
+  if (context.options.dryRun && equipmentResult.safeForDecomposition) {
+    const protectedCount = countProtectedDecomposition(equipmentResult.equipment, settings.decomposition);
+    if (protectedCount > 0) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "protected",
+        reason: "premium-or-unknown-affix",
+        count: protectedCount
+      });
+    }
+  }
+  while (true) {
     if (!equipmentResult.safeForDecomposition) {
       context.report.actions.push({
         type: "equipment-decompose",
@@ -545,46 +560,36 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
       return state;
     }
     const equipment = equipmentResult.equipment;
+    const candidates = safeDecompositionCandidates(equipment, settings.decomposition)
+      .filter((item) => !skippedEquipment.has(item.id))
+      .slice(0, DECOMPOSITION_BATCH_SIZE);
+    if (candidates.length === 0) break;
+    const equipmentIds = candidates.map((candidate) => candidate.id);
     if (context.options.dryRun) {
-      const protectedCount = countProtectedDecomposition(equipment, settings.decomposition);
-      if (protectedCount > 0) {
+      for (const candidate of candidates) {
         context.report.actions.push({
           type: "equipment-decompose",
-          status: "protected",
-          reason: "premium-or-unknown-affix",
-          count: protectedCount
+          status: "planned",
+          quality: candidate.quality,
+          level: candidate.level,
+          reason: "daily-cleanup"
         });
+        skippedEquipment.add(candidate.id);
       }
-    }
-    const candidate = chooseSafeDecomposition(
-      equipment.filter((item) => !skippedEquipment.has(item?.id)),
-      settings.decomposition
-    );
-    if (!candidate) break;
-    candidateAttempts += 1;
-    if (context.options.dryRun) {
-      context.report.actions.push({
-        type: "equipment-decompose",
-        status: "planned",
-        quality: candidate.quality,
-        level: candidate.level,
-        reason: "activity-target"
-      });
-      return purchaseActivityItem(context, state, failedRewards, activitySafety);
+      continue;
     }
 
     try {
-      const preview = dataOf(await context.api.post("/api/equipment/decompose-preview", { equipmentIds: [candidate.id] }));
-      if (!safeDecompositionPreview(preview, candidate.id)) {
-        skippedEquipment.add(candidate.id);
+      const preview = dataOf(await context.api.post("/api/equipment/decompose-preview", { equipmentIds }));
+      if (!safeDecompositionPreview(preview, equipmentIds)) {
+        for (const equipmentId of equipmentIds) skippedEquipment.add(equipmentId);
         consecutivePreviewFailures = 0;
-        context.report.actions.push({ type: "equipment-decompose", status: "skipped", reason: "preview-unconfirmed" });
+        context.report.actions.push({ type: "equipment-decompose", status: "skipped", count: equipmentIds.length, reason: "preview-unconfirmed" });
         continue;
       }
       consecutivePreviewFailures = 0;
     } catch (error) {
-      skippedEquipment.add(candidate.id);
-      context.report.actions.push({ type: "equipment-decompose", status: "failed", reason: safeError(error) });
+      context.report.actions.push({ type: "equipment-decompose", status: "failed", count: equipmentIds.length, reason: safeError(error) });
       if (transientRequestFailure(error)) {
         consecutivePreviewFailures += 1;
         if (consecutivePreviewFailures >= 3) {
@@ -592,6 +597,7 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
           return state;
         }
       } else {
+        for (const equipmentId of equipmentIds) skippedEquipment.add(equipmentId);
         consecutivePreviewFailures = 0;
       }
       continue;
@@ -600,23 +606,28 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
     const beforeCount = finiteCounter(state.bootstrap.daily?.decomposeCount);
     let ambiguousError;
     try {
-      await context.api.post("/api/equipment/decompose", { equipmentIds: [candidate.id] });
+      await context.api.post("/api/equipment/decompose", { equipmentIds });
     } catch (error) {
       if (!error.ambiguous) {
-        skippedEquipment.add(candidate.id);
-        context.report.actions.push({ type: "equipment-decompose", status: "failed", reason: safeError(error) });
+        for (const equipmentId of equipmentIds) skippedEquipment.add(equipmentId);
+        context.report.actions.push({ type: "equipment-decompose", status: "failed", count: equipmentIds.length, reason: safeError(error) });
         continue;
       }
       ambiguousError = error;
     }
-    state = await readDailyState(context.api);
-    const refreshedEquipment = await readEquipment(context.api);
+    const [refreshedState, refreshedEquipment] = await Promise.all([
+      readDailyState(context.api),
+      readEquipment(context.api)
+    ]);
+    state = refreshedState;
+    const remainingEquipmentIds = new Set(refreshedEquipment.map((item) => item?.id));
     const confirmed = counterIncreased(beforeCount, state.bootstrap.daily?.decomposeCount)
-      && !refreshedEquipment.some((item) => item?.id === candidate.id);
+      && equipmentIds.every((equipmentId) => !remainingEquipmentIds.has(equipmentId));
     if (!confirmed) {
       context.report.actions.push({
         type: "equipment-decompose",
         status: "uncertain",
+        count: equipmentIds.length,
         reason: ambiguousError ? "outcome-unknown" : "state-not-confirmed"
       });
       return state;
@@ -624,13 +635,20 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
     context.report.actions.push({
       type: "equipment-decompose",
       status: ambiguousError ? "reconciled" : "completed",
-      quality: candidate.quality,
-      level: candidate.level
+      count: equipmentIds.length
     });
-    allowActivityRewardRetry(failedRewards);
-    state = await claimDailyRewards(context, state, failedRewards, activitySafety);
-    equipmentResult = await runBestEquipment(context);
+    if (targetEnabled
+      && activityStateKnown(state)
+      && !activityTierClaimed(state, ACTIVITY_TARGET)
+      && !activityPursuitBlocked(failedRewards, activitySafety)) {
+      allowActivityRewardRetry(failedRewards);
+      state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+      equipmentResult = await runBestEquipment(context);
+    } else {
+      equipmentResult = { safeForDecomposition: true, equipment: refreshedEquipment };
+    }
   }
+  if (!targetEnabled) return state;
   if (!activityStateKnown(state)) {
     context.report.actions.push({ type: "activity-target", status: "stopped", reason: "unknown-activity-state" });
     return state;
@@ -640,18 +658,6 @@ async function pursueActivity(context, initialState, failedRewards, activitySafe
     return state;
   }
   if (activityTierClaimed(state, ACTIVITY_TARGET)) return state;
-  if (candidateAttempts >= ACTIVITY_MUTATION_LIMIT) {
-    context.report.actions.push({ type: "equipment-decompose", status: "stopped", reason: "candidate-limit" });
-    return state;
-  }
-  if (!equipmentResult.safeForDecomposition) {
-    context.report.actions.push({
-      type: "equipment-decompose",
-      status: "stopped",
-      reason: equipmentResult.reason ?? "equipment-comparison-unsafe"
-    });
-    return state;
-  }
   return purchaseActivityItem(context, state, failedRewards, activitySafety);
 }
 
@@ -1309,11 +1315,15 @@ function allowActivityRewardRetry(failedRewards) {
   }
 }
 
-function safeDecompositionPreview(preview, equipmentId) {
-  return Number(preview?.equipmentCount) === 1
+function safeDecompositionPreview(preview, equipmentIds) {
+  if (!Array.isArray(equipmentIds) || equipmentIds.length === 0) return false;
+  const expected = new Set(equipmentIds);
+  return expected.size === equipmentIds.length
+    && Number(preview?.equipmentCount) === equipmentIds.length
     && Array.isArray(preview?.equipmentIds)
-    && preview.equipmentIds.length === 1
-    && preview.equipmentIds[0] === equipmentId;
+    && preview.equipmentIds.length === equipmentIds.length
+    && preview.equipmentIds.every((equipmentId) => expected.delete(equipmentId))
+    && expected.size === 0;
 }
 
 function transientRequestFailure(error) {

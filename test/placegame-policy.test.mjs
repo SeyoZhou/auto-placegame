@@ -15,6 +15,7 @@ import {
   isIdleDue,
   lowestScoredEquippedSlot,
   personalBossPreviewLayers,
+  safeDecompositionCandidates,
   shouldChangeMap,
   stableJitterSeconds
 } from "../lib/placegame-policy.mjs";
@@ -265,6 +266,9 @@ test("safe decomposition applies configured level range and stable ordering", ()
   assert.equal(chooseSafeDecomposition(equipment, {
     qualities: ["white"], minLevel: 10, maxLevel: 20, protectPremiumAffixes: true
   })?.id, "lower-score");
+  assert.deepEqual(safeDecompositionCandidates(equipment, {
+    qualities: ["white"], minLevel: 10, maxLevel: 20, protectPremiumAffixes: true
+  }).map((item) => item.id), ["lower-score", "higher-score"]);
 });
 
 test("market selector buys the lowest actual one-unit gold charge within budget", () => {

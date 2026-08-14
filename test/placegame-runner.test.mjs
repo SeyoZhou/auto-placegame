@@ -714,7 +714,7 @@ test("daily rewards reject malformed endpoint identities", () => {
   assert.equal(nextDailyAction(state, [20]), undefined);
 });
 
-test("daily activity claims a known tier with a stale zero badge before spending assets", async () => {
+test("daily activity claims a known tier with a stale zero badge before cleaning equipment", async () => {
   const api = createDailyApi({
     claimedActivity: [20, 40, 60, 80],
     claimableActivity: [100],
@@ -725,25 +725,33 @@ test("daily activity claims a known tier with a stale zero badge before spending
 
   await runDaily(context);
 
-  assert.deepEqual(api.posts.map((entry) => entry.path), ["/api/daily/claim"]);
+  assert.deepEqual(api.posts.map((entry) => entry.path), [
+    "/api/daily/claim",
+    "/api/equipment/decompose-preview",
+    "/api/equipment/decompose"
+  ]);
   assert.equal(context.report.activity.status, "newly-complete");
 });
 
-test("daily activity performs no asset mutation when 100 is already claimed", async () => {
+test("daily decomposes every safe item when 100 is already claimed without buying", async () => {
   const api = createDailyApi({
     claimedActivity: [20, 40, 60, 80, 100],
-    equipment: [dailyEquipment({ id: "safe" })],
+    equipment: [dailyEquipment({ id: "first" }), dailyEquipment({ id: "second", score: 20 })],
     orders: [{ id: "cheap", orderType: "sell", itemType: "equipment", status: "active", currencyType: "gold", price: 1, amount: 1 }]
   });
   const context = dailyContext(api);
 
   await runDaily(context);
 
-  assert.equal(api.posts.some((entry) => entry.path.startsWith("/api/equipment/") || entry.path === "/api/market/buy"), false);
+  assert.deepEqual(api.posts.filter((entry) => entry.path === "/api/equipment/decompose").map((entry) => entry.body), [
+    { equipmentIds: ["first", "second"] }
+  ]);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/market/buy"), false);
+  assert.equal(api.equipment.length, 0);
   assert.equal(context.report.activity.status, "already-complete");
 });
 
-test("legacy activity tier subsets do not enable the 100-point asset ladder", async () => {
+test("legacy activity tier subsets clean equipment without enabling the market fallback", async () => {
   const api = createDailyApi({
     claimedActivity: [20],
     equipment: [dailyEquipment({ id: "safe" })],
@@ -754,11 +762,12 @@ test("legacy activity tier subsets do not enable the 100-point asset ladder", as
 
   await runDaily(context);
 
-  assert.equal(api.posts.some((entry) => entry.path.startsWith("/api/equipment/") || entry.path === "/api/market/buy"), false);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/equipment/decompose"), true);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/market/buy"), false);
   assert.equal(context.report.activity.reason, "target-not-configured");
 });
 
-test("daily activity stops asset mutations when claimed activity state is unknown", async () => {
+test("daily cleans equipment but skips the market when claimed activity state is unknown", async () => {
   const api = createDailyApi({
     claimedActivity: null,
     equipment: [dailyEquipment({ id: "safe" })],
@@ -768,7 +777,8 @@ test("daily activity stops asset mutations when claimed activity state is unknow
 
   await runDaily(context);
 
-  assert.equal(api.posts.some((entry) => entry.path.startsWith("/api/equipment/") || entry.path === "/api/market/buy"), false);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/equipment/decompose"), true);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/market/buy"), false);
   assert.equal(context.report.activity.reason, "unknown-activity-state");
 });
 
@@ -788,7 +798,7 @@ test("daily activity continues the ladder after an authoritative target claim re
   assert.equal(context.report.actions.find((entry) => entry.type === "activity-reward").status, "failed");
 });
 
-test("daily activity decomposes one safe item then claims 100 and stops", async () => {
+test("daily activity decomposes every safe item when the batch unlocks 100", async () => {
   const api = createDailyApi({
     claimedActivity: [20, 40, 60, 80],
     equipment: [dailyEquipment({ id: "first" }), dailyEquipment({ id: "second", score: 20 })],
@@ -798,11 +808,12 @@ test("daily activity decomposes one safe item then claims 100 and stops", async 
 
   await runDaily(context);
 
-  assert.equal(api.posts.filter((entry) => entry.path === "/api/equipment/decompose").length, 1);
-  assert.deepEqual(api.posts.find((entry) => entry.path === "/api/equipment/decompose").body, { equipmentIds: ["first"] });
+  assert.deepEqual(api.posts.filter((entry) => entry.path === "/api/equipment/decompose").map((entry) => entry.body), [
+    { equipmentIds: ["first", "second"] }
+  ]);
   assert.deepEqual(api.posts.find((entry) => entry.path === "/api/daily/claim").body, { point: 100 });
   assert.equal(context.report.activity.status, "newly-complete");
-  assert.equal(api.equipment.some((item) => item.id === "second"), true);
+  assert.equal(api.equipment.length, 0);
 });
 
 test("daily wears upgrades before considering replaced equipment for decomposition", async () => {
@@ -876,9 +887,11 @@ test("daily wears a reward-dropped upgrade before later decomposition", async ()
   const wearIndex = api.posts.findIndex((entry) => entry.path === "/api/equipment/wear");
   assert.equal(decompositionIndexes.length, 2);
   assert.ok(decompositionIndexes[0] < wearIndex && wearIndex < decompositionIndexes[1]);
+  assert.deepEqual(api.posts[decompositionIndexes[0]].body, { equipmentIds: ["first-safe", "second-safe"] });
   assert.deepEqual(api.posts[wearIndex].body, { equipmentId: "reward-upgrade" });
   assert.notDeepEqual(api.posts[decompositionIndexes[1]].body, { equipmentIds: ["reward-upgrade"] });
   assert.equal(api.equipment.find((item) => item.id === "reward-upgrade").status, "equipped");
+  assert.equal(api.equipment.some((item) => item.id === "current"), false);
 });
 
 test("daily activity buys at most one cheapest unit after decomposition is exhausted", async () => {
@@ -950,7 +963,7 @@ test("daily activity reconciles one ambiguous purchase from the daily counter", 
   assert.equal(context.report.activity.status, "newly-complete");
 });
 
-test("daily activity stops assets after an unresolved ambiguous target claim", async () => {
+test("daily cleans equipment but skips the market after an unresolved target claim", async () => {
   const api = createDailyApi({
     claimedActivity: [20, 40, 60, 80],
     claimableActivity: [100],
@@ -962,7 +975,8 @@ test("daily activity stops assets after an unresolved ambiguous target claim", a
 
   await runDaily(context);
 
-  assert.equal(api.posts.some((entry) => entry.path.startsWith("/api/equipment/") || entry.path === "/api/market/buy"), false);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/equipment/decompose"), true);
+  assert.equal(api.posts.some((entry) => entry.path === "/api/market/buy"), false);
   assert.equal(context.report.actions.find((entry) => entry.type === "activity-reward").status, "failed");
   assert.equal(context.report.actions.find((entry) => entry.type === "activity-target" && entry.status === "stopped").reason, "reward-claim-blocked");
 });
@@ -981,6 +995,39 @@ test("daily activity bounds repeated decomposition preview failures", async () =
   assert.equal(api.posts.filter((entry) => entry.path === "/api/equipment/decompose-preview").length, 3);
   assert.equal(api.posts.some((entry) => entry.path === "/api/equipment/decompose" || entry.path === "/api/market/buy"), false);
   assert.equal(context.report.actions.find((entry) => entry.reason === "preview-failure-limit").status, "stopped");
+});
+
+test("daily decomposition rejects a batch when preview omits a candidate", async () => {
+  const api = createDailyApi({
+    claimedActivity: [20, 40, 60, 80, 100],
+    equipment: [dailyEquipment({ id: "first" }), dailyEquipment({ id: "second" })],
+    decomposePreviewIds: ["first"]
+  });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  assert.equal(api.posts.some((entry) => entry.path === "/api/equipment/decompose"), false);
+  assert.equal(api.equipment.length, 2);
+  assert.deepEqual(context.report.actions.find((entry) => entry.type === "equipment-decompose"), {
+    type: "equipment-decompose",
+    status: "skipped",
+    count: 2,
+    reason: "preview-unconfirmed"
+  });
+});
+
+test("daily decomposition batches large inventory cleanup without truncation", async () => {
+  const equipment = Array.from({ length: 70 }, (_, index) => dailyEquipment({ id: `eq-${index}`, score: index }));
+  const api = createDailyApi({ claimedActivity: [20, 40, 60, 80, 100], equipment });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  assert.deepEqual(api.posts.filter((entry) => entry.path === "/api/equipment/decompose").map((entry) => entry.body.equipmentIds.length), [50, 20]);
+  assert.equal(api.posts.filter((entry) => entry.path === "/api/equipment/decompose-preview").length, 2);
+  assert.equal(api.equipment.length, 0);
+  assert.equal(context.report.activity.status, "already-complete");
 });
 
 test("daily activity skips purchase when the daily market count is already used", async () => {
@@ -1285,6 +1332,7 @@ function createDailyApi({
   failGuildRead = false,
   omitAfterClaim = new Set(),
   failDecomposePreviews = false,
+  decomposePreviewIds,
   decomposeUnlockPoints,
   rewardEquipmentByActivity = {}
 } = {}) {
@@ -1347,15 +1395,18 @@ function createDailyApi({
         wearEquipment(this.equipment, body.equipmentId);
       } else if (pathName === "/api/equipment/decompose-preview") {
         if (failDecomposePreviews) throw new Error("preview unavailable");
-        return { data: { equipmentIds: [...body.equipmentIds], equipmentCount: body.equipmentIds.length, goldGain: 1, materials: [] } };
+        const previewIds = decomposePreviewIds ?? body.equipmentIds;
+        return { data: { equipmentIds: [...previewIds], equipmentCount: previewIds.length, goldGain: 1, materials: [] } };
       } else if (pathName === "/api/equipment/decompose") {
         if (!skipMutation) {
-          state.bootstrap.daily.decomposeCount += 1;
+          state.bootstrap.daily.decomposeCount += body.equipmentIds.length;
           this.equipment = this.equipment.filter((entry) => !body.equipmentIds.includes(entry.id));
-          const unlockedPoint = pendingDecomposeUnlocks.shift();
-          if (unlockedPoint !== undefined) {
-            state.view.navigation.activityClaimableCount = 1;
-            claimablePoints.add(unlockedPoint);
+          for (const _equipmentId of body.equipmentIds) {
+            const unlockedPoint = pendingDecomposeUnlocks.shift();
+            if (unlockedPoint !== undefined) {
+              state.view.navigation.activityClaimableCount += 1;
+              claimablePoints.add(unlockedPoint);
+            }
           }
         }
       } else if (pathName === "/api/market/buy") {
