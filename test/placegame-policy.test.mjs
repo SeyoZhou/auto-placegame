@@ -67,6 +67,22 @@ test("adventure remains pending when any option is incomparable", () => {
   assert.equal(result.reason, "unknown-option");
 });
 
+test("adventure compares percentage yields and treats unchanged yield as neutral", () => {
+  const result = chooseAdventure([
+    { key: "clean", effectText: "经验收益 +8%" },
+    { key: "take_coin", effectText: "金币收益 +15%，经验收益 -5%" },
+    { key: "leave", effectText: "本次收益不变" }
+  ]);
+
+  assert.equal(result.reason, "experience");
+  assert.equal(result.choice.key, "clean");
+  assert.deepEqual(result.parsed.map(({ exp, gold }) => ({ exp, gold })), [
+    { exp: 8, gold: undefined },
+    { exp: -5, gold: 15 },
+    { exp: 0, gold: 0 }
+  ]);
+});
+
 test("stable jitter is deterministic and bounded", () => {
   const first = stableJitterSeconds("account-1", 12);
   assert.equal(first, stableJitterSeconds("account-1", 12));
@@ -116,6 +132,21 @@ test("personal boss layers prioritize progression, difficulty, and reward multip
   assert.equal(Object.hasOwn(personalBossPreviewLayers([bosses[1]], [
     { id: "eq-1", status: "equipped", slot: "weapon", score: 50 }
   ])[0].body, "targetSlot"), false);
+});
+
+test("personal boss layers select at most the three strongest combat skills", () => {
+  const boss = personalBoss();
+  boss.challengeOptions.skills = [
+    { key: "low", level: 5, outputPower: 100, survivalPower: 0 },
+    { key: "survival", level: 1, outputPower: 0, survivalPower: 300 },
+    { key: "top", level: 4, outputPower: 250, survivalPower: 100 },
+    { key: "tie-b", level: 2, outputPower: 150, survivalPower: 50 },
+    { key: "tie-a", level: 2, outputPower: 150, survivalPower: 50 }
+  ];
+
+  const [layer] = personalBossPreviewLayers([boss], []);
+
+  assert.deepEqual(layer.body.selectedSkillKeys, ["top", "survival", "tie-a"]);
 });
 
 test("personal boss layers reject blocked, unaffordable, ticketed, and exhausted candidates", () => {
@@ -174,6 +205,22 @@ test("best equipment upgrade chooses a strict score increase per slot", () => {
     candidateScore: 130
   });
   assert.equal(chooseBestEquipmentUpgrade(equipment, new Set(["weapon"])), undefined);
+});
+
+test("best equipment upgrade ignores items above the player level", () => {
+  const equipment = [
+    equipmentItem({ id: "current", status: "equipped", slot: "talisman", level: 33, score: 1734 }),
+    equipmentItem({ id: "too-high", slot: "talisman", level: 111, score: 2000 }),
+    equipmentItem({ id: "wearable", slot: "talisman", level: 74, score: 1800 })
+  ];
+
+  assert.deepEqual(chooseBestEquipmentUpgrade(equipment, new Set(), 74), {
+    slot: "talisman",
+    current: equipment[0],
+    candidate: equipment[2],
+    currentScore: 1734,
+    candidateScore: 1800
+  });
 });
 
 test("best equipment upgrade fills empty slots and rejects uncertain state", () => {

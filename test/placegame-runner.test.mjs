@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { ApiError } from "../lib/placegame-api.mjs";
 import {
   applyDefaults,
   assertFreeArcadeResult,
@@ -82,6 +83,30 @@ test("progress reporter redacts bearer values on stage failure", async () => {
   );
   assert.match(lines.at(-1), /Bearer \[redacted\]/);
   assert.doesNotMatch(lines.at(-1), /secret-session/);
+});
+
+test("progress reporter distinguishes network failures and includes server rejection details", async () => {
+  const lines = [];
+  const progress = createProgressReporter({ write: (line) => lines.push(line) });
+  const account = progress.account({ alias: "account-1", current: 1, total: 1 });
+
+  await assert.rejects(account.stage("read", async () => {
+    throw new ApiError("network request did not complete", {
+      path: "/api/read",
+      code: "TypeError",
+      transport: true
+    });
+  }));
+  await assert.rejects(account.stage("preview", async () => {
+    throw new ApiError("server rejected POST /api/boss/preview", {
+      path: "/api/boss/preview",
+      status: 400,
+      detail: "最多选择 3 个出战技能。"
+    });
+  }));
+
+  assert.match(lines.find((line) => line.includes("read failed")), /\/api\/read: network request failed/);
+  assert.match(lines.find((line) => line.includes("preview failed")), /\/api\/boss\/preview: request rejected \(最多选择 3 个出战技能。\)/);
 });
 
 test("progress output failure never interrupts account work", async () => {
@@ -214,6 +239,37 @@ test("run reports all phases in order", async (t) => {
   assert.match(lines.at(-1), /^\nSummary\ntest: ok/);
 });
 
+test("idle resolves a percentage adventure before switching to the better map", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-idle-adventure-map-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  await writeFile(configPath, '{"accounts":[{"name":"test","username":"u","password":"p"}]}\n');
+  await chmod(configPath, 0o600);
+  const { fetchImpl, posts } = createIdleAdventureFetch();
+  const output = [];
+
+  assert.equal(await main([
+    "idle",
+    "--json",
+    "--config", configPath,
+    "--state", path.join(directory, "state.json"),
+    "--log-dir", path.join(directory, "logs")
+  ], { fetchImpl, outputWrite: (line) => output.push(line) }), 0);
+
+  assert.deepEqual(posts, [
+    { path: "/api/battle/idle-collect", body: { adventureOptionKey: "clean" } },
+    { path: "/api/battle/change-map", body: { mapKey: "better" } }
+  ]);
+  assert.deepEqual(JSON.parse(output[0]).reports[0].actions.map((action) => [action.type, action.status]), [
+    ["adventure", "selected"],
+    ["idle-collect", "not-due"],
+    ["map", "changed"]
+  ]);
+});
+
 test("run continues daily rewards after the best-effort boss stage fails", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "placegame-boss-failure-test-"));
   t.after(async () => {
@@ -237,7 +293,7 @@ test("run continues daily rewards after the best-effort boss stage fails", async
     "--log-dir", path.join(directory, "logs")
   ], { fetchImpl, outputWrite: (line) => lines.push(line) }), 0);
 
-  assert.match(lines.find((line) => line.includes("personal boss failed")), /equipment\/list: request rejected/);
+  assert.match(lines.find((line) => line.includes("personal boss failed")), /equipment\/list: network request failed/);
   assert.equal(lines.some((line) => line.includes("daily rewards done")), true);
   assert.match(lines.at(-1), /^\nSummary\ntest: ok/);
 });
@@ -413,6 +469,20 @@ test("best equipment wears strict upgrades one slot at a time", async () => {
   assert.equal(result.equipment.find((item) => item.id === "weapon-best").status, "equipped");
 });
 
+test("best equipment never submits an item above the player level", async () => {
+  const api = createEquipmentApi([
+    dailyEquipment({ id: "current", status: "equipped", slot: "talisman", level: 33, score: 1734 }),
+    dailyEquipment({ id: "too-high", slot: "talisman", level: 111, score: 2000 }),
+    dailyEquipment({ id: "wearable", slot: "talisman", level: 74, score: 1800 })
+  ]);
+  const context = equipmentContext(api);
+
+  await runBestEquipment(context, 74);
+
+  assert.deepEqual(api.posts.map((entry) => entry.body), [{ equipmentId: "wearable" }]);
+  assert.equal(api.gets.includes("/api/client/bootstrap"), false);
+});
+
 test("best equipment continues later slots after an earlier authoritative failure", async () => {
   const api = createEquipmentApi([
     dailyEquipment({ id: "armor-current", status: "equipped", slot: "armor", score: 20 }),
@@ -501,6 +571,7 @@ test("best equipment dry run plans upgrades without wearing them", async () => {
 test("best equipment rejects a malformed equipment response", async () => {
   const context = equipmentContext({
     async get(pathName) {
+      if (pathName === "/api/client/bootstrap") return { data: { player: { level: 100 } } };
       assert.equal(pathName, "/api/equipment/list");
       return { data: {} };
     }
@@ -731,6 +802,22 @@ test("daily activity claims a known tier with a stale zero badge before cleaning
     "/api/equipment/decompose"
   ]);
   assert.equal(context.report.activity.status, "newly-complete");
+});
+
+test("daily activity does not probe higher tiers after the next tier is rejected", async () => {
+  const api = createDailyApi({ claimedActivity: [] });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  assert.deepEqual(
+    api.posts.filter((entry) => entry.path === "/api/daily/claim").map((entry) => entry.body.point),
+    [20]
+  );
+  assert.deepEqual(
+    context.report.actions.filter((entry) => entry.type === "activity-reward").map((entry) => [entry.point, entry.status]),
+    [[20, "failed"]]
+  );
 });
 
 test("daily decomposes every safe item when 100 is already claimed without buying", async () => {
@@ -1221,12 +1308,16 @@ function createEquipmentApi(equipment, {
   ambiguousIds = new Set(),
   failedIds = new Set(),
   unchangedIds = new Set(),
-  afterWear
+  afterWear,
+  playerLevel = 100
 } = {}) {
   return {
     equipment: structuredClone(equipment),
+    gets: [],
     posts: [],
     async get(pathName) {
+      this.gets.push(pathName);
+      if (pathName === "/api/client/bootstrap") return { data: { player: { level: playerLevel } } };
       if (pathName === "/api/equipment/list") return { data: structuredClone(this.equipment) };
       assert.fail(`unexpected GET ${pathName}`);
     },
@@ -1342,7 +1433,7 @@ function createDailyApi({
     : unlockActivityAfter === "decompose" ? [100] : [];
   const state = {
     bootstrap: {
-      player: { gold: 10_000 },
+      player: { gold: 10_000, level: 100 },
       daily: {
         key: "2026-08-13",
         ...(Array.isArray(claimedActivity) ? { claimedActivity: [...claimedActivity] } : {}),
@@ -1467,6 +1558,54 @@ function createAccountFailureFetch() {
     }
     return success(url, options);
   };
+}
+
+function createIdleAdventureFetch() {
+  const posts = [];
+  const bootstrap = {
+    player: { level: 72, idleRewardCapacityHours: 12 },
+    daily: { key: "2026-08-17", claimedActivity: [] },
+    idleAdventure: {
+      key: "quiet_shrine",
+      options: [
+        { key: "clean", effectText: "经验收益 +8%" },
+        { key: "take_coin", effectText: "金币收益 +15%，经验收益 -5%" },
+        { key: "leave", effectText: "本次收益不变" }
+      ]
+    }
+  };
+  const maps = [
+    { key: "current", current: true, unlocked: true, baseExpPerMin: 100, baseGoldPerMin: 50, efficiency: 1 },
+    { key: "better", current: false, unlocked: true, baseExpPerMin: 120, baseGoldPerMin: 60, efficiency: 1 }
+  ];
+  const fetchImpl = async (url, options) => {
+    const pathName = new URL(url).pathname;
+    const body = options.body ? JSON.parse(options.body) : undefined;
+    if (pathName === "/api/auth/login") {
+      return { ok: true, status: 200, json: async () => ({ data: { sessionToken: "session" } }) };
+    }
+    if (pathName === "/api/client/bootstrap") {
+      return { ok: true, status: 200, json: async () => ({ data: structuredClone(bootstrap) }) };
+    }
+    if (pathName === "/api/client/idle-summary") {
+      return { ok: true, status: 200, json: async () => ({ data: { validSeconds: 0 } }) };
+    }
+    if (pathName === "/api/client/dynamic-view") {
+      return { ok: true, status: 200, json: async () => ({ data: { maps: structuredClone(maps) } }) };
+    }
+    if (pathName === "/api/battle/idle-collect") {
+      posts.push({ path: pathName, body });
+      delete bootstrap.idleAdventure;
+      return { ok: true, status: 200, json: async () => ({ data: {} }) };
+    }
+    if (pathName === "/api/battle/change-map") {
+      posts.push({ path: pathName, body });
+      for (const map of maps) map.current = map.key === body.mapKey;
+      return { ok: true, status: 200, json: async () => ({ data: {} }) };
+    }
+    assert.fail(`unexpected request: ${options.method} ${pathName}`);
+  };
+  return { fetchImpl, posts };
 }
 
 function withoutDuration(line) {

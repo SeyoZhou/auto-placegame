@@ -351,7 +351,7 @@ export async function runDaily(context) {
   const failedRewards = new Set();
   const activitySafety = { blocked: false };
   state = await claimDailyRewards(context, state, failedRewards, activitySafety);
-  const equipmentResult = await runBestEquipment(context);
+  const equipmentResult = await runBestEquipment(context, state.bootstrap.player?.level);
   state = await cleanEquipmentAndPursueActivity(
     context,
     state,
@@ -362,25 +362,38 @@ export async function runDaily(context) {
   );
   if (!context.options.dryRun && activityStateKnown(state)) {
     state = await claimDailyRewards(context, state, failedRewards, activitySafety);
-    await runBestEquipment(context);
+    await runBestEquipment(context, state.bootstrap.player?.level);
   }
   reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled);
 }
 
-export async function runBestEquipment(context) {
+export async function runBestEquipment(context, knownPlayerLevel) {
   const skippedSlots = new Set();
   let safeForDecomposition = true;
   let unsafeReason;
   let equipment;
+  let playerLevel = Number(knownPlayerLevel);
   try {
-    equipment = await readEquipment(context.api);
+    const bootstrapRequest = Number.isInteger(playerLevel) && playerLevel >= 1
+      ? undefined
+      : context.api.get("/api/client/bootstrap");
+    const [equipmentList, bootstrapPayload] = await Promise.all([
+      readEquipment(context.api),
+      bootstrapRequest
+    ]);
+    equipment = equipmentList;
+    if (bootstrapPayload) playerLevel = Number(dataOf(bootstrapPayload)?.player?.level);
   } catch (error) {
     context.report.actions.push({ type: "equipment-wear", status: "failed", reason: safeError(error) });
     return { safeForDecomposition: false, equipment: undefined, reason: "equipment-state-read-failed" };
   }
+  if (!Number.isInteger(playerLevel) || playerLevel < 1) {
+    context.report.actions.push({ type: "equipment-wear", status: "stopped", reason: "player-level-unknown" });
+    return { safeForDecomposition: false, equipment, reason: "player-level-unknown" };
+  }
   let mutations = 0;
   while (mutations < EQUIPMENT_WEAR_LIMIT) {
-    const upgrade = chooseBestEquipmentUpgrade(equipment, skippedSlots);
+    const upgrade = chooseBestEquipmentUpgrade(equipment, skippedSlots, playerLevel);
     if (!upgrade) {
       const issue = equipmentComparisonIssue(equipment);
       if (issue) {
@@ -440,7 +453,7 @@ export async function runBestEquipment(context) {
     context.report.actions.push({ ...action, status: ambiguous ? "reconciled" : "completed" });
   }
 
-  if (chooseBestEquipmentUpgrade(equipment, skippedSlots)) {
+  if (chooseBestEquipmentUpgrade(equipment, skippedSlots, playerLevel)) {
     context.report.actions.push({ type: "equipment-wear", status: "stopped", reason: "mutation-limit" });
     return { safeForDecomposition: false, equipment, reason: "equipment-wear-mutation-limit" };
   }
@@ -643,7 +656,7 @@ async function cleanEquipmentAndPursueActivity(
       && !activityPursuitBlocked(failedRewards, activitySafety)) {
       allowActivityRewardRetry(failedRewards);
       state = await claimDailyRewards(context, state, failedRewards, activitySafety);
-      equipmentResult = await runBestEquipment(context);
+      equipmentResult = await runBestEquipment(context, state.bootstrap.player?.level);
     } else {
       equipmentResult = { safeForDecomposition: true, equipment: refreshedEquipment };
     }
@@ -1098,8 +1111,10 @@ export function nextDailyAction(state, knownActivityPoints, failedRewards = new 
   const claimedActivity = bootstrap.daily?.claimedActivity;
   if (Array.isArray(claimedActivity)) {
     const claimed = new Set(claimedActivity);
-    const point = knownActivityPoints.find((candidate) => !claimed.has(candidate) && !failedRewards.has(dailyRewardIdentity("activity-reward", candidate)));
-    if (point !== undefined) return { type: "activity-reward", path: "/api/daily/claim", body: { point }, point };
+    const point = knownActivityPoints.find((candidate) => !claimed.has(candidate));
+    if (point !== undefined && !failedRewards.has(dailyRewardIdentity("activity-reward", point))) {
+      return { type: "activity-reward", path: "/api/daily/claim", body: { point }, point };
+    }
   }
   const claimedMail = new Set(bootstrap.claimedMailRewardIds ?? []);
   const mail = (bootstrap.mails ?? []).find((entry) => validRewardKey(entry?.id) && entry.claimed !== true && !claimedMail.has(entry.id) && hasMailReward(entry.reward) && !failedRewards.has(dailyRewardIdentity("mail-attachment", entry.id)));
@@ -1553,11 +1568,20 @@ function safeError(error) {
   if (error instanceof ApiError) {
     let reason = "request rejected";
     if (error.authentication) reason = "authentication rejected";
-    else if (error.ambiguous) reason = "outcome uncertain after network failure";
+    else if (error.transport) reason = error.ambiguous ? "outcome uncertain after network failure" : "network request failed";
     else if (error.requiredVersion) reason = `client upgrade failed (server requires ${error.requiredVersion})`;
+    else if (error.detail) reason = `request rejected (${safeErrorText(error.detail)})`;
     return `${error.path ?? "request"}: ${reason}`;
   }
-  return String(error?.message ?? "unknown error").replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
+  return safeErrorText(error?.message ?? "unknown error");
+}
+
+function safeErrorText(value) {
+  return String(value)
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
 }
 
 export function createProgressReporter({ enabled = true, write = console.log, now = () => Date.now() } = {}) {
