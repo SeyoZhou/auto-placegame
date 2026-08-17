@@ -42,7 +42,6 @@ const DEFAULT_STATE = path.join(ROOT, ".placegame-state.local.json");
 const DEFAULT_LOG_DIR = path.join(ROOT, ".placegame-logs");
 const LOCK_FILE = path.join(ROOT, ".placegame-runtime", "run.lock");
 const COMMANDS = new Set(["status", "idle", "daily", "arcade", "boss", "run"]);
-const BOSS_MINIMUM_CHANCE = 80;
 const BOSS_SUBMISSION_LIMIT = 20;
 const KNOWN_ACTIVITY_POINTS = [20, 40, 60, 80, 100];
 const ACTIVITY_TARGET = 100;
@@ -828,7 +827,7 @@ async function selectBossCandidate(context, state) {
         context.report.warnings.push(`boss preview skipped: ${safeError(error)}`);
       }
     }
-    const selected = chooseBossPreview(previews, BOSS_MINIMUM_CHANCE);
+    const selected = chooseBossPreview(previews);
     if (selected) return { ...layer, ...selected };
   }
   return undefined;
@@ -1378,11 +1377,12 @@ export function applyDefaults(config) {
         activityRewardPoints: automation.daily?.activityRewardPoints ?? KNOWN_ACTIVITY_POINTS,
         marketMaxGold: automation.daily?.marketMaxGold ?? 300,
         decomposition: {
-          qualities: (automation.daily?.decomposition?.qualities ?? ["white", "green", "blue"])
+          qualities: (automation.daily?.decomposition?.qualities ?? ["white", "green", "blue", "purple", "orange"])
             .map((quality) => QUALITY_ALIASES[String(quality).toLowerCase()] ?? quality),
           minLevel: automation.daily?.decomposition?.minLevel,
-          maxLevel: automation.daily?.decomposition?.maxLevel,
-          protectPremiumAffixes: automation.daily?.decomposition?.protectPremiumAffixes ?? true
+          maxLevel: automation.daily?.decomposition?.maxLevel ?? 999,
+          maxScore: automation.daily?.decomposition?.maxScore ?? 99_999,
+          protectPremiumAffixes: automation.daily?.decomposition?.protectPremiumAffixes ?? false
         }
       }
     }
@@ -1422,6 +1422,9 @@ export function validateConfig(config) {
   }
   if (decomposition.minLevel !== undefined && decomposition.maxLevel !== undefined && decomposition.minLevel > decomposition.maxLevel) {
     throw new Error("decomposition minLevel must not exceed maxLevel");
+  }
+  if (!Number.isFinite(decomposition.maxScore) || decomposition.maxScore <= 0) {
+    throw new Error("decomposition maxScore must be a positive number");
   }
   if (typeof decomposition.protectPremiumAffixes !== "boolean") throw new Error("protectPremiumAffixes must be boolean");
 }

@@ -445,6 +445,21 @@ test("personal boss dry run previews the best candidate without challenging", as
   }]);
 });
 
+test("personal boss challenges at the 10 percent predicted win boundary", async () => {
+  const api = createBossApi({
+    freeRemaining: 1,
+    consumeFree: true,
+    previewResult: { chance: 10, predictedWin: true }
+  });
+  const context = bossContext(api);
+
+  await runPersonalBoss(context);
+
+  assert.equal(api.challengeCalls, 1);
+  assert.equal(context.report.actions[0].chance, 10);
+  assert.equal(context.report.actions[0].status, "won");
+});
+
 test("best equipment wears strict upgrades one slot at a time", async () => {
   const api = createEquipmentApi([
     dailyEquipment({ id: "weapon-current", status: "equipped", slot: "weapon", score: 10 }),
@@ -611,7 +626,7 @@ test("best equipment marks an unknown equipped score unsafe", async () => {
   }]);
 });
 
-test("best equipment marks an unknown candidate score unsafe", async () => {
+test("best equipment preserves an unknown-score candidate without blocking decomposition", async () => {
   const api = createEquipmentApi([
     dailyEquipment({ id: "current", status: "equipped", slot: "weapon", score: 10 }),
     dailyEquipment({ id: "candidate", slot: "weapon", score: null })
@@ -621,8 +636,8 @@ test("best equipment marks an unknown candidate score unsafe", async () => {
   const result = await runBestEquipment(context);
 
   assert.equal(api.posts.length, 0);
-  assert.equal(result.safeForDecomposition, false);
-  assert.equal(result.reason, "candidate-score-unknown");
+  assert.equal(result.safeForDecomposition, true);
+  assert.equal(result.reason, undefined);
 });
 
 test("personal boss submits the exact previewed challenge body", async () => {
@@ -637,7 +652,7 @@ test("personal boss submits the exact previewed challenge body", async () => {
     selectedSkillKeys: ["skill-1"],
     affixKey: "relentless",
     targetSlot: "weapon",
-    useMaterialBoost: false,
+    useMaterialBoost: true,
     buffKey: "none"
   }]);
 });
@@ -836,6 +851,36 @@ test("daily decomposes every safe item when 100 is already claimed without buyin
   assert.equal(api.posts.some((entry) => entry.path === "/api/market/buy"), false);
   assert.equal(api.equipment.length, 0);
   assert.equal(context.report.activity.status, "already-complete");
+});
+
+test("daily decomposition defaults include common through epic and enforce score and level ceilings", async () => {
+  const api = createDailyApi({
+    claimedActivity: [20, 40, 60, 80, 100],
+    equipment: [
+      dailyEquipment({ id: "common", quality: "white", score: 1 }),
+      dailyEquipment({ id: "premium", quality: "white", score: 2, rareRank: "极品" }),
+      dailyEquipment({ id: "unknown-rank", quality: "white", score: 3, rareRank: undefined }),
+      dailyEquipment({ id: "excellent", quality: "green", score: 4 }),
+      dailyEquipment({ id: "refined", quality: "blue", score: 5 }),
+      dailyEquipment({ id: "rare", quality: "purple", score: 6 }),
+      dailyEquipment({ id: "epic", quality: "orange", score: 7 }),
+      dailyEquipment({ id: "legendary", quality: "red", score: 8 }),
+      dailyEquipment({ id: "over-level", quality: "white", score: 9, level: 1_000 }),
+      dailyEquipment({ id: "at-score-limit", quality: "white", score: 99_999 }),
+      dailyEquipment({ id: "empty-score", quality: "white", score: "", slot: "ring" }),
+      dailyEquipment({ id: "whitespace-score", quality: "white", score: "   ", slot: "amulet" })
+    ]
+  });
+  const context = dailyContext(api);
+
+  await runDaily(context);
+
+  assert.deepEqual(api.posts.filter((entry) => entry.path === "/api/equipment/decompose").map((entry) => entry.body), [
+    { equipmentIds: ["common", "premium", "unknown-rank", "excellent", "refined", "rare", "epic"] }
+  ]);
+  assert.deepEqual(api.equipment.map((item) => item.id), [
+    "legendary", "over-level", "at-score-limit", "empty-score", "whitespace-score"
+  ]);
 });
 
 test("legacy activity tier subsets clean equipment without enabling the market fallback", async () => {
@@ -1156,13 +1201,14 @@ test("daily dry run plans safe decomposition without preview, decomposition, or 
   assert.equal(context.report.activity.status, "incomplete");
 });
 
-test("daily dry run reports protected equipment before the market fallback", async () => {
+test("daily dry run reports protected equipment when affix protection is enabled", async () => {
   const api = createDailyApi({
     claimedActivity: [20, 40, 60, 80],
     equipment: [dailyEquipment({ id: "premium", rareRank: "极品" })],
     orders: [{ id: "cheap", orderType: "sell", itemType: "equipment", status: "active", currencyType: "gold", price: 10, amount: 1 }]
   });
   const context = dailyContext(api, { dryRun: true });
+  context.config.automation.daily.decomposition.protectPremiumAffixes = true;
 
   await runDaily(context);
 
@@ -1182,10 +1228,11 @@ test("daily configuration defaults and validates safety controls", () => {
     activityRewardPoints: [20, 40, 60, 80, 100],
     marketMaxGold: 300,
     decomposition: {
-      qualities: ["white", "green", "blue"],
+      qualities: ["white", "green", "blue", "purple", "orange"],
       minLevel: undefined,
-      maxLevel: undefined,
-      protectPremiumAffixes: true
+      maxLevel: 999,
+      maxScore: 99_999,
+      protectPremiumAffixes: false
     }
   });
   assert.doesNotThrow(() => validateConfig(config));
@@ -1211,6 +1258,10 @@ test("daily configuration defaults and validates safety controls", () => {
   invalid.automation.daily.decomposition.minLevel = 20;
   invalid.automation.daily.decomposition.maxLevel = 10;
   assert.throws(() => validateConfig(invalid), /minLevel/);
+
+  const invalidMaxScore = structuredClone(config);
+  invalidMaxScore.automation.daily.decomposition.maxScore = 0;
+  assert.throws(() => validateConfig(invalidMaxScore), /maxScore/);
 
   const invalidTier = structuredClone(config);
   invalidTier.automation.daily.activityRewardPoints = [20, 999, 100];
@@ -1335,7 +1386,14 @@ function createEquipmentApi(equipment, {
   };
 }
 
-function createBossApi({ freeRemaining, challengeResult, ambiguousChallenge = false, consumeFree = false, recordBossAttempt = true }) {
+function createBossApi({
+  freeRemaining,
+  challengeResult,
+  previewResult = { chance: 88, predictedWin: true },
+  ambiguousChallenge = false,
+  consumeFree = false,
+  recordBossAttempt = true
+}) {
   let remaining = freeRemaining;
   let bossCount = 0;
   return {
@@ -1358,7 +1416,7 @@ function createBossApi({ freeRemaining, challengeResult, ambiguousChallenge = fa
     async post(pathName, body) {
       if (pathName === "/api/boss/preview") {
         this.previewCalls += 1;
-        return { data: { chance: 88, predictedWin: true } };
+        return { data: previewResult };
       }
       if (pathName === "/api/boss/challenge") {
         this.challengeCalls += 1;

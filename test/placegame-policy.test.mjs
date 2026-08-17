@@ -126,7 +126,7 @@ test("personal boss layers prioritize progression, difficulty, and reward multip
   assert.deepEqual(layers[0].buffKeys, ["none", "assault", "guard"]);
   assert.deepEqual(layers[0].body.selectedSkillKeys, ["skill-1"]);
   assert.equal(layers[0].body.targetSlot, "weapon");
-  assert.equal(layers[0].body.useMaterialBoost, false);
+  assert.equal(layers[0].body.useMaterialBoost, true);
 
   bosses[1].challengeOptions.targetSlots = undefined;
   assert.equal(Object.hasOwn(personalBossPreviewLayers([bosses[1]], [
@@ -166,15 +166,19 @@ test("personal boss layers reject blocked, unaffordable, ticketed, and exhausted
   assert.deepEqual(personalBossPreviewLayers([{ ...boss, type: "world" }], []), []);
 });
 
-test("boss preview selection enforces 80 percent and prefers no buff on an exact tie", () => {
+test("boss preview selection accepts 10 percent and prefers no buff on an exact tie", () => {
   const previews = [
-    { buffKey: "assault", preview: { chance: 79, predictedWin: true } },
+    { buffKey: "assault", preview: { chance: 9, predictedWin: true } },
     { buffKey: "guard", preview: { chance: 88, predictedWin: true } },
     { buffKey: "none", preview: { chance: 88, predictedWin: true } }
   ];
-  assert.deepEqual(chooseBossPreview(previews, 80), previews[2]);
-  assert.equal(chooseBossPreview([{ buffKey: "none", preview: { chance: 79, predictedWin: true } }], 80), undefined);
-  assert.equal(chooseBossPreview([{ buffKey: "none", preview: { chance: 90 } }], 80), undefined);
+  assert.deepEqual(chooseBossPreview(previews), previews[2]);
+  assert.deepEqual(chooseBossPreview([{ buffKey: "none", preview: { chance: 10, predictedWin: true } }]), {
+    buffKey: "none",
+    preview: { chance: 10, predictedWin: true }
+  });
+  assert.equal(chooseBossPreview([{ buffKey: "none", preview: { chance: 9, predictedWin: true } }]), undefined);
+  assert.equal(chooseBossPreview([{ buffKey: "none", preview: { chance: 90 } }]), undefined);
 });
 
 test("lowest scored target slot is stable and fail closed", () => {
@@ -260,47 +264,69 @@ test("equipment comparison rejects multiple equipped items when an upgrade is av
   });
 });
 
-test("equipment comparison rejects a bag candidate with an unknown score", () => {
+test("equipment comparison ignores a bag candidate with an unknown score", () => {
   const equipment = [
     equipmentItem({ id: "current", status: "equipped", slot: "weapon", score: 10 }),
     equipmentItem({ id: "candidate", slot: "weapon", score: null })
   ];
 
-  assert.deepEqual(equipmentComparisonIssue(equipment), {
-    slot: "weapon",
-    reason: "candidate-score-unknown"
-  });
+  assert.equal(equipmentComparisonIssue(equipment), undefined);
 });
 
-test("safe decomposition defaults protect premium, equipped, locked, and higher-quality equipment", () => {
+test("safe decomposition includes configured qualities without affix protection", () => {
   const equipment = [
-    equipmentItem({ id: "common", quality: "white", level: 5 }),
-    equipmentItem({ id: "excellent", quality: "green", level: 6 }),
-    equipmentItem({ id: "refined", quality: "blue", level: 7 }),
-    equipmentItem({ id: "rare", quality: "purple", level: 1 }),
-    equipmentItem({ id: "premium", quality: "white", rareRank: "小极品" }),
-    equipmentItem({ id: "unknown-rank", quality: "white", rareRank: undefined }),
+    equipmentItem({ id: "common", quality: "white", score: 1 }),
+    equipmentItem({ id: "premium", quality: "white", score: 2, rareRank: "小极品" }),
+    equipmentItem({ id: "unknown-rank", quality: "white", score: 3, rareRank: undefined }),
+    equipmentItem({ id: "excellent", quality: "green", score: 4 }),
+    equipmentItem({ id: "refined", quality: "blue", score: 5 }),
+    equipmentItem({ id: "rare", quality: "purple", score: 6 }),
+    equipmentItem({ id: "epic", quality: "orange", score: 7 }),
+    equipmentItem({ id: "legendary", quality: "red", score: 8 }),
     equipmentItem({ id: "equipped", quality: "white", status: "equipped" }),
     equipmentItem({ id: "locked", quality: "white", locked: true })
   ];
-  assert.deepEqual(chooseSafeDecomposition(equipment, {
-    qualities: ["white", "green", "blue"],
-    protectPremiumAffixes: true
-  })?.id, "common");
+  assert.deepEqual(safeDecompositionCandidates(equipment, {
+    qualities: ["white", "green", "blue", "purple", "orange"],
+    protectPremiumAffixes: false
+  }).map((item) => item.id), [
+    "common", "premium", "unknown-rank", "excellent", "refined", "rare", "epic"
+  ]);
+});
 
-  equipment[0].status = "listed";
-  assert.equal(chooseSafeDecomposition(equipment, {
+test("safe decomposition can opt in to premium and unknown affix protection", () => {
+  const equipment = [
+    equipmentItem({ id: "ordinary", score: 1 }),
+    equipmentItem({ id: "premium", score: 2, rareRank: "小极品" }),
+    equipmentItem({ id: "unknown-rank", score: 3, rareRank: undefined })
+  ];
+  assert.deepEqual(safeDecompositionCandidates(equipment, {
     qualities: ["white"],
     protectPremiumAffixes: true
-  }), undefined);
-  assert.equal(chooseSafeDecomposition(equipment, {
-    qualities: ["purple"],
-    protectPremiumAffixes: true
-  })?.id, "rare");
+  }).map((item) => item.id), ["ordinary"]);
   assert.equal(countProtectedDecomposition(equipment, {
     qualities: ["white"],
     protectPremiumAffixes: true
   }), 2);
+});
+
+test("safe decomposition enforces score and level ceilings and rejects empty scores", () => {
+  const equipment = [
+    equipmentItem({ id: "below-score-at-level", score: 99_998, level: 999 }),
+    equipmentItem({ id: "at-score-limit", score: 99_999 }),
+    equipmentItem({ id: "above-level-limit", score: 1, level: 1_000 }),
+    equipmentItem({ id: "empty-score", score: "" }),
+    equipmentItem({ id: "whitespace-score", score: "   " }),
+    equipmentItem({ id: "boolean-score", score: false }),
+    equipmentItem({ id: "missing-score", score: undefined })
+  ];
+
+  assert.deepEqual(safeDecompositionCandidates(equipment, {
+    qualities: ["white"],
+    maxLevel: 999,
+    maxScore: 99_999,
+    protectPremiumAffixes: false
+  }).map((item) => item.id), ["below-score-at-level"]);
 });
 
 test("safe decomposition applies configured level range and stable ordering", () => {

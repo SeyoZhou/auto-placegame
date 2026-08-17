@@ -40,9 +40,9 @@ node placegame-auto.mjs boss
 node placegame-auto.mjs run
 ```
 
-使用 `--account account-1` 选择指定别名的账号，使用 `--json` 获取结构化输出。`run` 会依次执行挂机/地图维护、免费街机、个人首领和每日奖励。个人首领只使用共享的 5 次免费胜场，预测胜率不低于 80%，不使用门票，单轮最多提交 20 次挑战。每日奖励会领取签到、主线/支线、成就、图鉴、赛季、邮件、活跃宝箱和已达成的公会进度奖励，但不会自动捐献。
+使用 `--account account-1` 选择指定别名的账号，使用 `--json` 获取结构化输出。`run` 会依次执行挂机/地图维护、免费街机、个人首领和每日奖励。个人首领只使用共享的 5 次免费胜场，预测胜率不低于 10%，不使用门票，并开启素材加成来提升装备品质；单轮最多提交 20 次挑战。每日奖励会领取签到、主线/支线、成就、图鉴、赛季、邮件、活跃宝箱和已达成的公会进度奖励，但不会自动捐献。
 
-每日活跃默认尝试领取 `20/40/60/80/100` 档。运行器每次都会先穿戴各部位评分最高的装备，再分批安全分解背包中所有普通、优秀和精良装备；即使已经领取 100 档也会完成清理。默认保留所有 `小极品/极品/大极品` 和未知词条等级装备。清理完成后若仍未达到 100，每个账号每天最多购买一件实际成交额最低且不超过 300 金币的市场商品。运行器不会自动强化、上架、捐献或消费元宝。
+每日活跃默认尝试领取 `20/40/60/80/100` 档。运行器每次都会先穿戴各部位评分最高的装备，再分批分解背包中的普通、优秀、精良、稀有和史诗装备；即使已经领取 100 档也会完成清理。默认不保护高级或未知词条，但只处理未锁定、等级不高于 999、评分有效且低于 99999 的背包装备；评分为空、纯空格或缺失时跳过。清理完成后若仍未达到 100，每个账号每天最多购买一件实际成交额最低且不超过 300 金币的市场商品。运行器不会自动强化、上架、捐献或消费元宝。
 
 可在 `automation.daily` 中调整安全范围：
 
@@ -51,15 +51,15 @@ node placegame-auto.mjs run
   "activityRewardPoints": [20, 40, 60, 80, 100],
   "marketMaxGold": 300,
   "decomposition": {
-    "qualities": ["common", "excellent", "refined"],
-    "minLevel": 1,
-    "maxLevel": 20,
-    "protectPremiumAffixes": true
+    "qualities": ["common", "excellent", "refined", "rare", "epic"],
+    "maxLevel": 999,
+    "maxScore": 99999,
+    "protectPremiumAffixes": false
   }
 }
 ```
 
-`qualities` 支持 `common`、`excellent`、`refined`、`rare`、`epic`、`legendary` 和 `mythic`。省略 `minLevel` 或 `maxLevel` 表示该方向不设限制。先使用 `run --dry-run` 检查计划动作；模拟运行只读取状态和首领预览，不挑战、分解或购买。
+`qualities` 支持 `common`、`excellent`、`refined`、`rare`、`epic`、`legendary` 和 `mythic`。`maxLevel` 为包含边界，`maxScore` 为不包含边界；评分必须是非空有效数字。显式设置 `protectPremiumAffixes: true` 可保留高级和未知词条装备。先使用 `run --dry-run` 检查计划动作；模拟运行只读取状态和首领预览，不挑战、分解或购买。
 
 运行时 Session 和操作日志存储在 `.placegame-state.local.json` 中；脱敏后的 JSONL 报告写入 `.placegame-logs/`。这两个路径均已被 Git 忽略。
 每日 JSONL 报告默认保留 30 天；可通过账号配置中的 `automation.logRetentionDays` 调整保留时间。
@@ -125,9 +125,9 @@ node placegame-auto.mjs boss
 node placegame-auto.mjs run
 ```
 
-Use `--account account-1` to select one alias and `--json` for structured output. `run` executes idle/map maintenance, free arcade, personal bosses, and daily rewards. Personal-boss automation uses only the shared five free wins, requires at least an 80% predicted win chance, never spends tickets, and submits at most 20 challenges per run. Daily rewards include sign-in, main and side quests, achievements, codex, season, reward mail, activity chests, and earned guild progress; the runner never donates automatically.
+Use `--account account-1` to select one alias and `--json` for structured output. `run` executes idle/map maintenance, free arcade, personal bosses, and daily rewards. Personal-boss automation uses only the shared five free wins, requires at least a 10% predicted win chance, never spends tickets, enables the material boost for higher-quality equipment, and submits at most 20 challenges per run. Daily rewards include sign-in, main and side quests, achievements, codex, season, reward mail, activity chests, and earned guild progress; the runner never donates automatically.
 
-The activity ladder claims the known `20/40/60/80/100` tiers. On every run, it first equips the highest-scoring item in each slot, then safely decomposes every common, excellent, and refined bag item in bounded batches, even when the 100-point chest is already claimed. Premium and unknown affix ranks are protected by default. If 100 is still incomplete after cleanup, the final fallback buys at most one lowest-charge market unit per account per day, capped at 300 gold. It never enhances, lists, donates, or spends rare currency.
+The activity ladder claims the known `20/40/60/80/100` tiers. On every run, it first equips the highest-scoring item in each slot, then decomposes common, excellent, refined, rare, and epic bag items in bounded batches, even when the 100-point chest is already claimed. Premium and unknown affix ranks are not protected by default, but only unlocked bag items at level 999 or lower with a valid score below 99999 are eligible; empty, whitespace-only, or missing scores are skipped. If 100 is still incomplete after cleanup, the final fallback buys at most one lowest-charge market unit per account per day, capped at 300 gold. It never enhances, lists, donates, or spends rare currency.
 
 Configure the safety boundary under `automation.daily`:
 
@@ -136,15 +136,15 @@ Configure the safety boundary under `automation.daily`:
   "activityRewardPoints": [20, 40, 60, 80, 100],
   "marketMaxGold": 300,
   "decomposition": {
-    "qualities": ["common", "excellent", "refined"],
-    "minLevel": 1,
-    "maxLevel": 20,
-    "protectPremiumAffixes": true
+    "qualities": ["common", "excellent", "refined", "rare", "epic"],
+    "maxLevel": 999,
+    "maxScore": 99999,
+    "protectPremiumAffixes": false
   }
 }
 ```
 
-Supported quality names are `common`, `excellent`, `refined`, `rare`, `epic`, `legendary`, and `mythic`. Omit either level boundary to leave it open. Run `run --dry-run` first to inspect planned actions; dry-run performs reads and boss previews but never challenges, decomposes, or buys.
+Supported quality names are `common`, `excellent`, `refined`, `rare`, `epic`, `legendary`, and `mythic`. `maxLevel` is inclusive and `maxScore` is exclusive; the score must be a non-empty finite number. Set `protectPremiumAffixes: true` explicitly to retain premium and unknown affix ranks. Run `run --dry-run` first to inspect planned actions; dry-run performs reads and boss previews but never challenges, decomposes, or buys.
 
 Runtime Sessions and action journals are stored in `.placegame-state.local.json`. Redacted JSONL reports go to `.placegame-logs/`. Both paths are ignored by Git.
 Daily JSONL reports are retained for 30 days by default; change `automation.logRetentionDays` in the account config to adjust this.
