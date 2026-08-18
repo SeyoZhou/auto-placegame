@@ -37,10 +37,13 @@ node placegame-auto.mjs idle
 node placegame-auto.mjs daily
 node placegame-auto.mjs arcade
 node placegame-auto.mjs boss
+node placegame-auto.mjs world-boss --dry-run
 node placegame-auto.mjs run
 ```
 
 使用 `--account account-1` 选择指定别名的账号，使用 `--json` 获取结构化输出。`run` 会依次执行挂机/地图维护、免费街机、个人首领和每日奖励。个人首领只使用共享的 5 次免费胜场，预测胜率不低于 10%，不使用门票，并开启素材加成来提升装备品质；单轮最多提交 20 次挑战。每日奖励会领取签到、主线/支线、成就、图鉴、赛季、邮件、活跃宝箱和已达成的公会进度奖励，但不会自动捐献。
+
+`world-boss` 是独立命令，只在北京时间 `10:00–11:00`、`16:00–17:00`、`20:00–21:00` 内工作，绝不会由 `run` 或 `daily` 间接触发。它启动时检测主机 IANA 时区和 UTC 偏移，再换算到 `Asia/Shanghai`；每场按低等级 Boss 优先，最多并发处理 3 个账号，并让每个可协助 Boss 使用最多 3 次服务器确认的剩余次数。同一账号和 Boss 始终逐次执行并在每次后刷新；无法确认的提交只停止该账号/Boss 组合。只有服务端明确返回 `rewardStatus: "claimable"` 时才领奖。
 
 每日活跃默认尝试领取 `20/40/60/80/100` 档。运行器每次都会先穿戴各部位评分最高的装备，再分批分解背包中的普通、优秀、精良、稀有和史诗装备；即使已经领取 100 档也会完成清理。默认不保护高级或未知词条，但只处理未锁定、等级不高于 999、评分有效且低于 99999 的背包装备；评分为空、纯空格或缺失时跳过。清理完成后若仍未达到 100，每个账号每天最多购买一件实际成交额最低且不超过 300 金币的市场商品。运行器不会自动强化、上架、捐献或消费元宝。
 
@@ -78,7 +81,7 @@ Linux 用户级服务：
 sh scripts/install-linux-systemd.sh
 ```
 
-两个调度器都会每 15 分钟运行一次，并在启动或登录时运行一次。业务逻辑会为每个账号加入稳定的随机偏移，大约每六小时收取一次，并在接近 12 小时上限时优先收取。使用同一个脚本并加上 `--uninstall` 即可卸载。
+安装脚本会创建两个彼此独立的任务：日常任务每 15 分钟运行一次；世界 Boss 常驻调度器在启动时记录本地时区，如果当前正处于活动窗口则恢复一次未完成场次，之后按北京时间每天 `10:00`、`16:00`、`20:00` 准点各触发一次。日常业务仍会为每个账号加入稳定的随机偏移，大约每六小时收取一次，并在接近 12 小时上限时优先收取。使用同一个脚本并加上 `--uninstall` 即可卸载两项任务。
 
 ### 验证
 
@@ -122,10 +125,13 @@ node placegame-auto.mjs idle
 node placegame-auto.mjs daily
 node placegame-auto.mjs arcade
 node placegame-auto.mjs boss
+node placegame-auto.mjs world-boss --dry-run
 node placegame-auto.mjs run
 ```
 
 Use `--account account-1` to select one alias and `--json` for structured output. `run` executes idle/map maintenance, free arcade, personal bosses, and daily rewards. Personal-boss automation uses only the shared five free wins, requires at least a 10% predicted win chance, never spends tickets, enables the material boost for higher-quality equipment, and submits at most 20 challenges per run. Daily rewards include sign-in, main and side quests, achievements, codex, season, reward mail, activity chests, and earned guild progress; the runner never donates automatically.
+
+`world-boss` is independent and only runs inside the `10:00–11:00`, `16:00–17:00`, and `20:00–21:00` Beijing windows; neither `run` nor `daily` invokes it. It detects the host IANA timezone and UTC offset before converting to `Asia/Shanghai`, prioritizes lower-level bosses, processes at most three accounts concurrently, and uses up to three server-confirmed remaining assists for every assistable boss. Each account/boss pair remains serial and refreshes after every assist. An ambiguous mutation stops only that pair. Rewards are claimed only for the explicit server state `rewardStatus: "claimable"`.
 
 The activity ladder claims the known `20/40/60/80/100` tiers. On every run, it first equips the highest-scoring item in each slot, then decomposes common, excellent, refined, rare, and epic bag items in bounded batches, even when the 100-point chest is already claimed. Premium and unknown affix ranks are not protected by default, but only unlocked bag items at level 999 or lower with a valid score below 99999 are eligible; empty, whitespace-only, or missing scores are skipped. If 100 is still incomplete after cleanup, the final fallback buys at most one lowest-charge market unit per account per day, capped at 300 gold. It never enhances, lists, donates, or spends rare currency.
 
@@ -163,7 +169,7 @@ Linux user service:
 sh scripts/install-linux-systemd.sh
 ```
 
-Both schedulers run every 15 minutes and once at startup/login. Business logic collects each account at roughly six hours with stable per-account jitter and prioritizes collection near the 12-hour cap. Uninstall with the same script plus `--uninstall`.
+The installer creates two independent jobs. Daily automation runs every 15 minutes. The persistent world-boss scheduler logs the detected host timezone at startup, recovers one incomplete event when startup occurs inside an activity window, then triggers once at exactly `10:00`, `16:00`, and `20:00` Beijing time. Daily collection still uses stable per-account jitter around six hours and prioritizes collection near the 12-hour cap. Uninstall both jobs with the same script plus `--uninstall`.
 
 ### Verify
 

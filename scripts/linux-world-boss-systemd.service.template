@@ -1,0 +1,17 @@
+[Unit]
+Description=PlaceGame world boss scheduler (Beijing time)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory="__PROJECT__"
+ExecStart="__NODE__" "__PROJECT__/scripts/world-boss-scheduler.mjs"
+Restart=always
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

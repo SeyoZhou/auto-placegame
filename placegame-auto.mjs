@@ -17,8 +17,11 @@ import {
 } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { ApiError, PlaceGameApi, dataOf } from "./lib/placegame-api.mjs";
+import { mapWithConcurrency, serializeCalls } from "./lib/placegame-async.mjs";
 import {
+  BEIJING_TIME_ZONE,
   blackjackDecision,
+  beijingWorldBossEvent,
   chooseAdventure,
   chooseBestEquipmentUpgrade,
   chooseBossPreview,
@@ -27,6 +30,7 @@ import {
   countProtectedDecomposition,
   equipmentComparisonIssue,
   effectiveMapRates,
+  formatBeijingTime,
   isIdleDue,
   isEquipmentWorn,
   personalBossPreviewLayers,
@@ -35,13 +39,14 @@ import {
   stableJitterSeconds,
   stableKey
 } from "./lib/placegame-policy.mjs";
+import { executeWorldBossSession } from "./lib/placegame-world-boss.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG = path.join(ROOT, ".placegame-accounts.local.json");
 const DEFAULT_STATE = path.join(ROOT, ".placegame-state.local.json");
 const DEFAULT_LOG_DIR = path.join(ROOT, ".placegame-logs");
 const LOCK_FILE = path.join(ROOT, ".placegame-runtime", "run.lock");
-const COMMANDS = new Set(["status", "idle", "daily", "arcade", "boss", "run"]);
+const COMMANDS = new Set(["status", "idle", "daily", "arcade", "boss", "world-boss", "run"]);
 const BOSS_SUBMISSION_LIMIT = 20;
 const KNOWN_ACTIVITY_POINTS = [20, 40, 60, 80, 100];
 const ACTIVITY_TARGET = 100;
@@ -90,8 +95,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const statePath = path.resolve(options.state ?? DEFAULT_STATE);
   const logDir = path.resolve(options.logDir ?? DEFAULT_LOG_DIR);
   const outputWrite = dependencies.outputWrite ?? console.log;
-  const state = await loadState(statePath);
-  const releaseLock = await acquireLock();
+  const releaseLock = await acquireLock(options.command === "world-boss" ? 5 * 60 * 1_000 : 0);
   const reports = [];
   const clientVersions = new Map();
   const progress = createProgressReporter({
@@ -99,37 +103,55 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     write: dependencies.progressWrite ?? outputWrite,
     now: dependencies.now
   });
+  let timeContext;
   let exitCode = 0;
   try {
+    const state = await loadState(statePath);
     const selected = selectAccounts(config.accounts, options.account);
     progress.start({ command: options.command, total: selected.length, dryRun: options.dryRun });
-    for (const [index, account] of selected) {
-      const alias = account.name || `account-${index + 1}`;
-      const report = { alias, command: options.command, dryRun: options.dryRun, startedAt: new Date().toISOString(), actions: [] };
-      const accountProgress = progress.account({ alias, current: reports.length + 1, total: selected.length });
-      const server = account.server ?? config.server;
-      let api;
-      try {
-        api = new PlaceGameApi({
-          baseUrl: server,
-          version: clientVersions.get(server),
-          timeoutMs: config.automation.requestTimeoutMs,
-          fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
-        });
-        const accountState = state.accounts[alias] ??= { actions: {} };
-        accountState.actions ??= {};
-        await accountProgress.stage("authentication", () => authenticate({ api, account, accountState, state, statePath }));
-        await runCommand({ api, alias, accountState, state, statePath, config, options, report }, accountProgress);
-        report.ok = true;
-      } catch (error) {
-        report.ok = false;
-        report.error = safeError(error);
-        exitCode = 1;
+    if (options.command === "world-boss") {
+      timeContext = detectWorldBossTimeContext(dependencies.currentDate?.() ?? new Date());
+      exitCode = await runWorldBossCommand({
+        selected,
+        config,
+        options,
+        state,
+        statePath,
+        progress,
+        reports,
+        timeContext,
+        clientVersions,
+        fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
+      });
+    } else {
+      for (const [index, account] of selected) {
+        const alias = account.name || `account-${index + 1}`;
+        const report = { alias, command: options.command, dryRun: options.dryRun, startedAt: new Date().toISOString(), actions: [] };
+        const accountProgress = progress.account({ alias, current: reports.length + 1, total: selected.length });
+        const server = account.server ?? config.server;
+        let api;
+        try {
+          api = new PlaceGameApi({
+            baseUrl: server,
+            version: clientVersions.get(server),
+            timeoutMs: config.automation.requestTimeoutMs,
+            fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
+          });
+          const accountState = state.accounts[alias] ??= { actions: {} };
+          accountState.actions ??= {};
+          await accountProgress.stage("authentication", () => authenticate({ api, account, accountState, state, statePath }));
+          await runCommand({ api, alias, accountState, state, statePath, config, options, report }, accountProgress);
+          report.ok = true;
+        } catch (error) {
+          report.ok = false;
+          report.error = safeError(error);
+          exitCode = 1;
+        }
+        if (api) clientVersions.set(server, api.version);
+        report.finishedAt = new Date().toISOString();
+        accountProgress.finish({ ok: report.ok, error: report.error });
+        reports.push(report);
       }
-      if (api) clientVersions.set(server, api.version);
-      report.finishedAt = new Date().toISOString();
-      accountProgress.finish({ ok: report.ok, error: report.error });
-      reports.push(report);
     }
     await appendReports(logDir, reports, config.automation.logRetentionDays);
     progress.finish({
@@ -140,9 +162,157 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     await releaseLock();
   }
 
-  const output = { command: options.command, dryRun: options.dryRun, reports };
+  const output = { command: options.command, dryRun: options.dryRun, ...(timeContext ? { timeContext } : {}), reports };
   outputWrite(options.json ? JSON.stringify(output) : `\nSummary\n${formatReports(reports)}`);
   return exitCode;
+}
+
+async function runWorldBossCommand({
+  selected,
+  config,
+  options,
+  state,
+  statePath,
+  progress,
+  reports,
+  timeContext,
+  clientVersions,
+  fetchImpl
+}) {
+  const event = beijingWorldBossEvent(new Date(timeContext.instant));
+  const entries = selected.map(([index, account], position) => {
+    const alias = account.name || `account-${index + 1}`;
+    const report = {
+      alias,
+      command: options.command,
+      dryRun: options.dryRun,
+      startedAt: new Date().toISOString(),
+      timeContext,
+      actions: []
+    };
+    reports.push(report);
+    return {
+      account,
+      alias,
+      report,
+      progress: progress.account({ alias, current: position + 1, total: selected.length })
+    };
+  });
+
+  if (!event) {
+    for (const entry of entries) {
+      entry.report.actions.push({ type: "world-boss", status: "skipped", reason: "outside-activity-window" });
+      finishWorldBossEntry(entry, true);
+    }
+    return 0;
+  }
+  if (state.worldBoss?.events?.[event.id]?.status === "completed") {
+    for (const entry of entries) {
+      entry.report.actions.push({ type: "world-boss", status: "skipped", reason: "event-already-completed", eventId: event.id });
+      finishWorldBossEntry(entry, true);
+    }
+    return 0;
+  }
+
+  const writeState = () => saveState(statePath, state);
+  const save = serializeCalls(writeState);
+  const clients = [];
+  await mapWithConcurrency(entries, 3, async (entry) => {
+    const server = entry.account.server ?? config.server;
+    const api = new PlaceGameApi({
+      baseUrl: server,
+      version: clientVersions.get(server),
+      timeoutMs: config.automation.requestTimeoutMs,
+      fetchImpl
+    });
+    try {
+      const accountState = state.accounts[entry.alias] ??= { actions: {} };
+      accountState.actions ??= {};
+      await entry.progress.stage("authentication", () => authenticate({
+        api,
+        account: entry.account,
+        accountState,
+        state,
+        statePath,
+        save
+      }));
+      clients.push({ alias: entry.alias, api, report: entry.report });
+    } catch (error) {
+      entry.report.error = safeError(error);
+      finishWorldBossEntry(entry, false);
+    } finally {
+      clientVersions.set(server, api.version);
+    }
+  });
+
+  if (clients.length > 0) {
+    const session = await executeWorldBossSession({
+      clients,
+      event,
+      state,
+      saveState: writeState,
+      dryRun: options.dryRun,
+      concurrency: 3
+    });
+    for (const alias of session.unresolvedAliases) {
+      const entry = entries.find((candidate) => candidate.alias === alias);
+      if (entry) entry.report.error = "world boss work incomplete";
+    }
+  }
+  if (clients.length !== entries.length && !options.dryRun) {
+    state.worldBoss ??= { events: {} };
+    state.worldBoss.events ??= {};
+    const eventState = state.worldBoss.events[event.id] ??= { accounts: {} };
+    eventState.status = "incomplete";
+    eventState.updatedAt = new Date().toISOString();
+    delete eventState.completedAt;
+    await save();
+  }
+  let exitCode = 0;
+  for (const entry of entries) {
+    if (entry.report.finishedAt) {
+      exitCode = 1;
+      continue;
+    }
+    const incomplete = Boolean(entry.report.error);
+    if (incomplete) {
+      entry.report.error = "world boss work incomplete";
+      exitCode = 1;
+    }
+    finishWorldBossEntry(entry, !incomplete);
+  }
+  return exitCode;
+}
+
+function finishWorldBossEntry(entry, ok) {
+  entry.report.ok = ok;
+  entry.report.finishedAt = new Date().toISOString();
+  entry.progress.finish({ ok, error: entry.report.error });
+}
+
+export function detectWorldBossTimeContext(now = new Date()) {
+  const date = now instanceof Date ? new Date(now.getTime()) : new Date(now);
+  if (!Number.isFinite(date.getTime())) throw new Error("current time is invalid");
+  const hostTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (typeof hostTimeZone !== "string" || !hostTimeZone.trim()) {
+    throw new Error("host IANA timezone could not be detected");
+  }
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: hostTimeZone }).format(date);
+  } catch {
+    throw new Error("host IANA timezone could not be detected");
+  }
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const hostUtcOffset = `${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2, "0")}:${String(absoluteOffset % 60).padStart(2, "0")}`;
+  return {
+    instant: date.toISOString(),
+    hostTimeZone,
+    hostUtcOffset,
+    beijingTimeZone: BEIJING_TIME_ZONE,
+    beijingTime: formatBeijingTime(date)
+  };
 }
 
 async function runCommand(context, progress) {
@@ -188,7 +358,7 @@ async function runBestEffortBossStage(progress, context) {
   }
 }
 
-async function authenticate({ api, account, accountState, state, statePath }) {
+async function authenticate({ api, account, accountState, state, statePath, save = () => saveState(statePath, state) }) {
   const credentialFingerprint = createHash("sha256").update(account.username).digest("hex");
   const fingerprintChanged = accountState.credentialFingerprint !== credentialFingerprint;
   if (accountState.credentialFingerprint && accountState.credentialFingerprint !== credentialFingerprint) {
@@ -197,7 +367,7 @@ async function authenticate({ api, account, accountState, state, statePath }) {
     accountState.actions = {};
   }
   accountState.credentialFingerprint = credentialFingerprint;
-  if (fingerprintChanged) await saveState(statePath, state);
+  if (fingerprintChanged) await save();
   if (accountState.session) {
     api.setSession(accountState.session);
     try {
@@ -206,7 +376,7 @@ async function authenticate({ api, account, accountState, state, statePath }) {
       if (!(error instanceof ApiError) || !error.authentication) throw error;
       delete accountState.session;
       delete accountState.sessionExpiresAt;
-      await saveState(statePath, state);
+      await save();
     }
   }
   const login = dataOf(await api.post("/api/auth/login", {
@@ -217,7 +387,7 @@ async function authenticate({ api, account, accountState, state, statePath }) {
   accountState.session = login.sessionToken;
   accountState.sessionExpiresAt = login.expiresAt;
   api.setSession(login.sessionToken);
-  await saveState(statePath, state);
+  await save();
   return dataOf(await api.get("/api/client/bootstrap"));
 }
 
@@ -1484,33 +1654,44 @@ async function saveState(statePath, state) {
   await chmod(statePath, 0o600);
 }
 
-async function acquireLock() {
+async function acquireLock(waitMs = 0) {
   await ensurePrivateDirectory(path.dirname(LOCK_FILE), "runtime directory");
-  let handle;
-  try {
-    handle = await open(LOCK_FILE, "wx", 0o600);
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    const lockInfo = await lstat(LOCK_FILE);
-    if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) throw new Error("run lock must be a regular non-symlink file");
-    let running = true;
+  const deadline = Date.now() + waitMs;
+  while (true) {
     try {
-      const pid = Number(await readFile(LOCK_FILE, "utf8"));
-      if (!Number.isInteger(pid) || pid < 1) running = false;
-      else process.kill(pid, 0);
-    } catch (checkError) {
-      if (checkError.code === "ESRCH" || checkError instanceof SyntaxError) running = false;
-      else if (checkError.code === "ENOENT") return acquireLock();
+      const handle = await open(LOCK_FILE, "wx", 0o600);
+      await handle.writeFile(String(process.pid));
+      await handle.close();
+      return async () => {
+        try { await unlink(LOCK_FILE); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const lockInfo = await lstat(LOCK_FILE).catch((lockError) => {
+        if (lockError.code === "ENOENT") return undefined;
+        throw lockError;
+      });
+      if (!lockInfo) continue;
+      if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) throw new Error("run lock must be a regular non-symlink file");
+      let running = true;
+      try {
+        const pid = Number(await readFile(LOCK_FILE, "utf8"));
+        if (!Number.isInteger(pid) || pid < 1) running = false;
+        else process.kill(pid, 0);
+      } catch (checkError) {
+        if (checkError.code === "ESRCH" || checkError instanceof SyntaxError) running = false;
+        else if (checkError.code === "ENOENT") continue;
+      }
+      if (!running) {
+        await unlink(LOCK_FILE).catch((unlinkError) => {
+          if (unlinkError.code !== "ENOENT") throw unlinkError;
+        });
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error("another automation process is already running");
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    if (running) throw new Error("another automation process is already running");
-    await unlink(LOCK_FILE);
-    return acquireLock();
   }
-  await handle.writeFile(String(process.pid));
-  await handle.close();
-  return async () => {
-    try { await unlink(LOCK_FILE); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  };
 }
 
 async function appendReports(logDir, reports, retentionDays) {
@@ -1670,7 +1851,7 @@ function formatReports(reports) {
 }
 
 function printHelp() {
-  console.log(`PlaceGame daily automation\n\nUsage:\n  node placegame-auto.mjs [run|status|idle|daily|arcade|boss] [options]\n\nOptions:\n  --config <path>   Account config (default: .placegame-accounts.local.json)\n  --state <path>    Private Session/action state\n  --log-dir <path>  Redacted JSONL report directory\n  --account <alias> Run one configured account\n  --dry-run         Read state and report planned mutations\n  --json            Print structured output\n  --help            Show this help`);
+  console.log(`PlaceGame daily automation\n\nUsage:\n  node placegame-auto.mjs [run|status|idle|daily|arcade|boss|world-boss] [options]\n\nOptions:\n  --config <path>   Account config (default: .placegame-accounts.local.json)\n  --state <path>    Private Session/action state\n  --log-dir <path>  Redacted JSONL report directory\n  --account <alias> Run one configured account\n  --dry-run         Read state and report planned mutations\n  --json            Print structured output\n  --help            Show this help`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

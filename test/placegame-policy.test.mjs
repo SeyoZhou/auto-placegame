@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   blackjackDecision,
   blackjackValue,
+  beijingWorldBossEvent,
   chooseAdventure,
   chooseBestMap,
   chooseBossPreview,
@@ -17,8 +18,50 @@ import {
   personalBossPreviewLayers,
   safeDecompositionCandidates,
   shouldChangeMap,
-  stableJitterSeconds
+  stableJitterSeconds,
+  worldBossCandidates,
+  worldBossRewardIsClaimable,
+  nextBeijingWorldBossStart
 } from "../lib/placegame-policy.mjs";
+
+test("world boss event windows are anchored to Beijing time", () => {
+  assert.deepEqual(
+    beijingWorldBossEvent(new Date("2026-08-18T02:30:00.000Z")),
+    {
+      id: "2026-08-18@10:00",
+      date: "2026-08-18",
+      startHour: 10,
+      startAt: "2026-08-18T02:00:00.000Z",
+      endAt: "2026-08-18T03:00:00.000Z"
+    }
+  );
+  assert.equal(beijingWorldBossEvent(new Date("2026-08-18T03:00:00.000Z")), undefined);
+  assert.equal(beijingWorldBossEvent(new Date("2026-08-18T07:59:59.999Z")), undefined);
+  assert.equal(beijingWorldBossEvent(new Date("2026-08-18T08:00:00.000Z")).id, "2026-08-18@16:00");
+});
+
+test("next world boss start crosses Beijing midnight correctly", () => {
+  assert.equal(nextBeijingWorldBossStart(new Date("2026-08-18T02:00:00.000Z")).toISOString(), "2026-08-18T08:00:00.000Z");
+  assert.equal(nextBeijingWorldBossStart(new Date("2026-08-18T13:00:00.000Z")).toISOString(), "2026-08-19T02:00:00.000Z");
+});
+
+test("world boss candidates fail closed and prioritize lower tiers", () => {
+  const bosses = [
+    { bossKey: "high", instanceId: "h", status: "active", remainingAttemptCount: 3, maxAttemptCount: 3, requiredLevel: 80 },
+    { bossKey: "low", instanceId: "l", status: "active", remainingAttemptCount: 2, maxAttemptCount: 3, requiredLevel: 10 },
+    { bossKey: "blocked", instanceId: "b", status: "active", remainingAttemptCount: 3, maxAttemptCount: 3, requiredLevel: 1, assistBlockedReason: "level" },
+    { bossKey: "ended", instanceId: "e", status: "defeated", remainingAttemptCount: 3, maxAttemptCount: 3, requiredLevel: 1 },
+    { bossKey: "unknown", instanceId: "u", remainingAttemptCount: 3, maxAttemptCount: 3, requiredLevel: 1 }
+  ];
+  assert.deepEqual(worldBossCandidates(bosses).map((boss) => boss.bossKey), ["low", "high"]);
+});
+
+test("world boss rewards require an explicit claimable marker", () => {
+  assert.equal(worldBossRewardIsClaimable({ rewardStatus: "claimable" }), true);
+  assert.equal(worldBossRewardIsClaimable({ rewardStatus: "pending" }), false);
+  assert.equal(worldBossRewardIsClaimable({ rewardStatus: "available" }), false);
+  assert.equal(worldBossRewardIsClaimable({}), false);
+});
 
 test("map selection maximizes effective experience then effective gold", () => {
   const maps = [

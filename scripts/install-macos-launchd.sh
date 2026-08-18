@@ -2,16 +2,19 @@
 set -eu
 
 LABEL="cn.placegame.daily-automation"
+WORLD_BOSS_LABEL="cn.placegame.world-boss-automation"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(dirname "$SCRIPT_DIR")
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$LABEL.plist"
+WORLD_BOSS_PLIST_PATH="$PLIST_DIR/$WORLD_BOSS_LABEL.plist"
 NODE_BIN=$(command -v node || true)
 
 if [ "${1:-}" = "--uninstall" ]; then
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  rm -f "$PLIST_PATH"
-  echo "Removed $LABEL"
+  launchctl bootout "gui/$(id -u)/$WORLD_BOSS_LABEL" 2>/dev/null || true
+  rm -f "$PLIST_PATH" "$WORLD_BOSS_PLIST_PATH"
+  echo "Removed $LABEL and $WORLD_BOSS_LABEL"
   exit 0
 fi
 
@@ -49,8 +52,15 @@ sed \
   -e "s|__NODE__|$NODE_XML|g" \
   -e "s|__PROJECT__|$PROJECT_XML|g" \
   "$SCRIPT_DIR/macos-launchd.plist.template" > "$PLIST_PATH"
+sed \
+  -e "s|__NODE__|$NODE_XML|g" \
+  -e "s|__PROJECT__|$PROJECT_XML|g" \
+  "$SCRIPT_DIR/macos-world-boss-launchd.plist.template" > "$WORLD_BOSS_PLIST_PATH"
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$WORLD_BOSS_LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+launchctl bootstrap "gui/$(id -u)" "$WORLD_BOSS_PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
-echo "Installed $LABEL. Logs: $PROJECT_DIR/.placegame-logs/"
+launchctl kickstart -k "gui/$(id -u)/$WORLD_BOSS_LABEL"
+echo "Installed $LABEL and $WORLD_BOSS_LABEL. Logs: $PROJECT_DIR/.placegame-logs/"

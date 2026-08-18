@@ -167,6 +167,95 @@ test("main streams progress in human mode and keeps JSON output clean", async (t
   assert.equal(JSON.parse(jsonLines[0]).reports[0].alias, "test");
 });
 
+test("world boss command skips outside Beijing activity windows without networking", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-world-boss-window-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  await writeFile(configPath, '{"accounts":[{"name":"test","username":"u","password":"p"}]}\n');
+  await chmod(configPath, 0o600);
+  const output = [];
+
+  assert.equal(await main([
+    "world-boss",
+    "--config", configPath,
+    "--state", path.join(directory, "state.json"),
+    "--log-dir", path.join(directory, "logs"),
+    "--json"
+  ], {
+    currentDate: () => new Date("2026-08-18T07:30:00.000Z"),
+    fetchImpl: async () => assert.fail("outside-window command must not use the network"),
+    outputWrite: (line) => output.push(line)
+  }), 0);
+
+  const result = JSON.parse(output[0]);
+  assert.equal(result.timeContext.beijingTime, "2026-08-18T15:30:00");
+  assert.match(result.timeContext.hostUtcOffset, /^[+-]\d{2}:\d{2}$/);
+  assert.deepEqual(result.reports[0].actions, [
+    { type: "world-boss", status: "skipped", reason: "outside-activity-window" }
+  ]);
+});
+
+test("world boss dry run plans the current event without assist or reward mutations", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-world-boss-dry-run-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  await writeFile(configPath, '{"accounts":[{"name":"test","username":"u","password":"p"}]}\n');
+  await chmod(configPath, 0o600);
+  const requests = [];
+  const output = [];
+  const fetchImpl = async (url, options) => {
+    const pathName = new URL(url).pathname;
+    requests.push({ path: pathName, method: options.method });
+    let data;
+    if (pathName === "/api/auth/login") data = { sessionToken: "session" };
+    else if (pathName === "/api/client/bootstrap") data = {};
+    else if (pathName === "/api/boss/world-status") data = [{
+      bossKey: "low",
+      instanceId: "instance",
+      status: "active",
+      remainingAttemptCount: 3,
+      maxAttemptCount: 3,
+      requiredLevel: 10,
+      rewardStatus: "pending"
+    }];
+    else if (pathName === "/api/client/dynamic-view") data = {
+      bosses: [{ key: "low", type: "world", requiredLevel: 10, assistBlockedReason: null }]
+    };
+    else assert.fail(`unexpected request: ${options.method} ${pathName}`);
+    return { ok: true, status: 200, json: async () => ({ data }) };
+  };
+
+  assert.equal(await main([
+    "world-boss",
+    "--dry-run",
+    "--config", configPath,
+    "--state", path.join(directory, "state.json"),
+    "--log-dir", path.join(directory, "logs"),
+    "--json"
+  ], {
+    currentDate: () => new Date("2026-08-18T08:00:00.000Z"),
+    fetchImpl,
+    outputWrite: (line) => output.push(line)
+  }), 0);
+
+  assert.equal(requests.some((request) => request.path === "/api/boss/assist"), false);
+  assert.equal(requests.some((request) => request.path === "/api/boss/claim-reward"), false);
+  const action = JSON.parse(output[0]).reports[0].actions.find((entry) => entry.type === "world-boss-assist");
+  assert.deepEqual(action, {
+    type: "world-boss-assist",
+    status: "planned",
+    bossKey: "low",
+    instanceId: "instance",
+    attempts: 3
+  });
+});
+
 test("accounts on the same server reuse a negotiated client version", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "placegame-version-negotiation-test-"));
   t.after(async () => {
