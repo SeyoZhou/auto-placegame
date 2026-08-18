@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check": "node --check placegame-auto.mjs"
+    "check": "node --check placegame-auto.mjs && node --check lib/placegame-async.mjs && node --check lib/placegame-world-boss.mjs && node --check scripts/world-boss-scheduler.mjs"
   },
   "engines": {
     "node": ">=24"

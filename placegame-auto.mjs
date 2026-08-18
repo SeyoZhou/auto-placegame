@@ -17,24 +17,61 @@ import {
 } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { ApiError, PlaceGameApi, dataOf } from "./lib/placegame-api.mjs";
+import { mapWithConcurrency, serializeCalls } from "./lib/placegame-async.mjs";
 import {
+  BEIJING_TIME_ZONE,
   blackjackDecision,
+  beijingWorldBossEvent,
   chooseAdventure,
+  chooseBestEquipmentUpgrade,
+  chooseBossPreview,
   chooseCoinLane,
+  chooseLowestChargeMarketOrder,
+  countProtectedDecomposition,
+  equipmentComparisonIssue,
   effectiveMapRates,
+  formatBeijingTime,
   isIdleDue,
+  isEquipmentWorn,
+  personalBossPreviewLayers,
+  safeDecompositionCandidates,
   shouldChangeMap,
   stableJitterSeconds,
   stableKey
 } from "./lib/placegame-policy.mjs";
+import { executeWorldBossSession } from "./lib/placegame-world-boss.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const CLIENT_VERSION = "0.2.35";
 const DEFAULT_CONFIG = path.join(ROOT, ".placegame-accounts.local.json");
 const DEFAULT_STATE = path.join(ROOT, ".placegame-state.local.json");
 const DEFAULT_LOG_DIR = path.join(ROOT, ".placegame-logs");
 const LOCK_FILE = path.join(ROOT, ".placegame-runtime", "run.lock");
-const COMMANDS = new Set(["status", "idle", "daily", "arcade", "run"]);
+const COMMANDS = new Set(["status", "idle", "daily", "arcade", "boss", "world-boss", "run"]);
+const BOSS_SUBMISSION_LIMIT = 20;
+const KNOWN_ACTIVITY_POINTS = [20, 40, 60, 80, 100];
+const ACTIVITY_TARGET = 100;
+const ACTIVITY_MUTATION_LIMIT = 60;
+const EQUIPMENT_WEAR_LIMIT = 60;
+const DECOMPOSITION_BATCH_SIZE = 50;
+const DAILY_REWARD_LIMIT_IDENTITY = "daily-rewards:mutation-limit";
+const QUALITY_ALIASES = {
+  common: "white",
+  normal: "white",
+  white: "white",
+  excellent: "green",
+  green: "green",
+  refined: "blue",
+  blue: "blue",
+  rare: "purple",
+  purple: "purple",
+  epic: "orange",
+  orange: "orange",
+  legendary: "red",
+  red: "red",
+  mythic: "gold",
+  gold: "gold"
+};
+const QUALITY_KEYS = new Set(Object.values(QUALITY_ALIASES));
 
 class ArcadeSafetyError extends Error {
   constructor(message) {
@@ -57,62 +94,271 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
 
   const statePath = path.resolve(options.state ?? DEFAULT_STATE);
   const logDir = path.resolve(options.logDir ?? DEFAULT_LOG_DIR);
-  const state = await loadState(statePath);
-  const releaseLock = await acquireLock();
+  const outputWrite = dependencies.outputWrite ?? console.log;
+  const releaseLock = await acquireLock(options.command === "world-boss" ? 5 * 60 * 1_000 : 0);
   const reports = [];
+  const clientVersions = new Map();
+  const progress = createProgressReporter({
+    enabled: !options.json,
+    write: dependencies.progressWrite ?? outputWrite,
+    now: dependencies.now
+  });
+  let timeContext;
   let exitCode = 0;
   try {
+    const state = await loadState(statePath);
     const selected = selectAccounts(config.accounts, options.account);
-    for (const [index, account] of selected) {
-      const alias = account.name || `account-${index + 1}`;
-      const report = { alias, command: options.command, dryRun: options.dryRun, startedAt: new Date().toISOString(), actions: [] };
-      try {
-        const api = new PlaceGameApi({
-          baseUrl: account.server ?? config.server,
-          version: CLIENT_VERSION,
-          timeoutMs: config.automation.requestTimeoutMs,
-          fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
-        });
-        const accountState = state.accounts[alias] ??= { actions: {} };
-        accountState.actions ??= {};
-        await authenticate({ api, account, accountState, state, statePath });
-        await runCommand({ api, alias, accountState, state, statePath, config, options, report });
-        report.ok = true;
-      } catch (error) {
-        report.ok = false;
-        report.error = safeError(error);
-        exitCode = 1;
+    progress.start({ command: options.command, total: selected.length, dryRun: options.dryRun });
+    if (options.command === "world-boss") {
+      timeContext = detectWorldBossTimeContext(dependencies.currentDate?.() ?? new Date());
+      exitCode = await runWorldBossCommand({
+        selected,
+        config,
+        options,
+        state,
+        statePath,
+        progress,
+        reports,
+        timeContext,
+        clientVersions,
+        fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
+      });
+    } else {
+      for (const [index, account] of selected) {
+        const alias = account.name || `account-${index + 1}`;
+        const report = { alias, command: options.command, dryRun: options.dryRun, startedAt: new Date().toISOString(), actions: [] };
+        const accountProgress = progress.account({ alias, current: reports.length + 1, total: selected.length });
+        const server = account.server ?? config.server;
+        let api;
+        try {
+          api = new PlaceGameApi({
+            baseUrl: server,
+            version: clientVersions.get(server),
+            timeoutMs: config.automation.requestTimeoutMs,
+            fetchImpl: dependencies.fetchImpl ?? globalThis.fetch
+          });
+          const accountState = state.accounts[alias] ??= { actions: {} };
+          accountState.actions ??= {};
+          await accountProgress.stage("authentication", () => authenticate({ api, account, accountState, state, statePath }));
+          await runCommand({ api, alias, accountState, state, statePath, config, options, report }, accountProgress);
+          report.ok = true;
+        } catch (error) {
+          report.ok = false;
+          report.error = safeError(error);
+          exitCode = 1;
+        }
+        if (api) clientVersions.set(server, api.version);
+        report.finishedAt = new Date().toISOString();
+        accountProgress.finish({ ok: report.ok, error: report.error });
+        reports.push(report);
       }
-      report.finishedAt = new Date().toISOString();
-      reports.push(report);
     }
     await appendReports(logDir, reports, config.automation.logRetentionDays);
+    progress.finish({
+      succeeded: reports.filter((report) => report.ok).length,
+      failed: reports.filter((report) => !report.ok).length
+    });
   } finally {
     await releaseLock();
   }
 
-  const output = { command: options.command, dryRun: options.dryRun, reports };
-  console.log(options.json ? JSON.stringify(output) : formatReports(reports));
+  const output = { command: options.command, dryRun: options.dryRun, ...(timeContext ? { timeContext } : {}), reports };
+  outputWrite(options.json ? JSON.stringify(output) : `\nSummary\n${formatReports(reports)}`);
   return exitCode;
 }
 
-async function runCommand(context) {
+async function runWorldBossCommand({
+  selected,
+  config,
+  options,
+  state,
+  statePath,
+  progress,
+  reports,
+  timeContext,
+  clientVersions,
+  fetchImpl
+}) {
+  const event = beijingWorldBossEvent(new Date(timeContext.instant));
+  const entries = selected.map(([index, account], position) => {
+    const alias = account.name || `account-${index + 1}`;
+    const report = {
+      alias,
+      command: options.command,
+      dryRun: options.dryRun,
+      startedAt: new Date().toISOString(),
+      timeContext,
+      actions: []
+    };
+    reports.push(report);
+    return {
+      account,
+      alias,
+      report,
+      progress: progress.account({ alias, current: position + 1, total: selected.length })
+    };
+  });
+
+  if (!event) {
+    for (const entry of entries) {
+      entry.report.actions.push({ type: "world-boss", status: "skipped", reason: "outside-activity-window" });
+      finishWorldBossEntry(entry, true);
+    }
+    return 0;
+  }
+  if (state.worldBoss?.events?.[event.id]?.status === "completed") {
+    for (const entry of entries) {
+      entry.report.actions.push({ type: "world-boss", status: "skipped", reason: "event-already-completed", eventId: event.id });
+      finishWorldBossEntry(entry, true);
+    }
+    return 0;
+  }
+
+  const writeState = () => saveState(statePath, state);
+  const save = serializeCalls(writeState);
+  const clients = [];
+  await mapWithConcurrency(entries, 3, async (entry) => {
+    const server = entry.account.server ?? config.server;
+    const api = new PlaceGameApi({
+      baseUrl: server,
+      version: clientVersions.get(server),
+      timeoutMs: config.automation.requestTimeoutMs,
+      fetchImpl
+    });
+    try {
+      const accountState = state.accounts[entry.alias] ??= { actions: {} };
+      accountState.actions ??= {};
+      await entry.progress.stage("authentication", () => authenticate({
+        api,
+        account: entry.account,
+        accountState,
+        state,
+        statePath,
+        save
+      }));
+      clients.push({ alias: entry.alias, api, report: entry.report });
+    } catch (error) {
+      entry.report.error = safeError(error);
+      finishWorldBossEntry(entry, false);
+    } finally {
+      clientVersions.set(server, api.version);
+    }
+  });
+
+  if (clients.length > 0) {
+    const session = await executeWorldBossSession({
+      clients,
+      event,
+      state,
+      saveState: writeState,
+      dryRun: options.dryRun,
+      concurrency: 3
+    });
+    for (const alias of session.unresolvedAliases) {
+      const entry = entries.find((candidate) => candidate.alias === alias);
+      if (entry) entry.report.error = "world boss work incomplete";
+    }
+  }
+  if (clients.length !== entries.length && !options.dryRun) {
+    state.worldBoss ??= { events: {} };
+    state.worldBoss.events ??= {};
+    const eventState = state.worldBoss.events[event.id] ??= { accounts: {} };
+    eventState.status = "incomplete";
+    eventState.updatedAt = new Date().toISOString();
+    delete eventState.completedAt;
+    await save();
+  }
+  let exitCode = 0;
+  for (const entry of entries) {
+    if (entry.report.finishedAt) {
+      exitCode = 1;
+      continue;
+    }
+    const incomplete = Boolean(entry.report.error);
+    if (incomplete) {
+      entry.report.error = "world boss work incomplete";
+      exitCode = 1;
+    }
+    finishWorldBossEntry(entry, !incomplete);
+  }
+  return exitCode;
+}
+
+function finishWorldBossEntry(entry, ok) {
+  entry.report.ok = ok;
+  entry.report.finishedAt = new Date().toISOString();
+  entry.progress.finish({ ok, error: entry.report.error });
+}
+
+export function detectWorldBossTimeContext(now = new Date()) {
+  const date = now instanceof Date ? new Date(now.getTime()) : new Date(now);
+  if (!Number.isFinite(date.getTime())) throw new Error("current time is invalid");
+  const hostTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (typeof hostTimeZone !== "string" || !hostTimeZone.trim()) {
+    throw new Error("host IANA timezone could not be detected");
+  }
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: hostTimeZone }).format(date);
+  } catch {
+    throw new Error("host IANA timezone could not be detected");
+  }
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const hostUtcOffset = `${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2, "0")}:${String(absoluteOffset % 60).padStart(2, "0")}`;
+  return {
+    instant: date.toISOString(),
+    hostTimeZone,
+    hostUtcOffset,
+    beijingTimeZone: BEIJING_TIME_ZONE,
+    beijingTime: formatBeijingTime(date)
+  };
+}
+
+async function runCommand(context, progress) {
   if (context.options.command === "status") {
-    await runStatus(context);
+    await runStage(progress, context, "status", runStatus);
   } else if (context.options.command === "idle") {
-    await runIdle(context);
+    await runStage(progress, context, "idle and map", runIdle);
   } else if (context.options.command === "daily") {
-    await runDaily(context);
+    await runStage(progress, context, "best equipment", runBestEquipment);
+    await runBestEffortBossStage(progress, context);
+    await runStage(progress, context, "daily rewards", runDaily);
   } else if (context.options.command === "arcade") {
-    await runArcade(context);
+    await runStage(progress, context, "free arcade", runArcade);
+  } else if (context.options.command === "boss") {
+    await runStage(progress, context, "best equipment", runBestEquipment);
+    await runStage(progress, context, "personal boss", runPersonalBoss);
   } else {
-    await runIdle(context);
-    await runArcade(context);
-    await runDaily(context);
+    await runStage(progress, context, "idle and map", runIdle);
+    await runStage(progress, context, "free arcade", runArcade);
+    await runStage(progress, context, "best equipment", runBestEquipment);
+    await runBestEffortBossStage(progress, context);
+    await runStage(progress, context, "daily rewards", runDaily);
   }
 }
 
-async function authenticate({ api, account, accountState, state, statePath }) {
+async function runStage(progress, context, label, operation) {
+  const actionCount = context.report.actions.length;
+  return progress.stage(
+    label,
+    () => operation(context),
+    () => formatResultCount(context.report.actions.length - actionCount)
+  );
+}
+
+async function runBestEffortBossStage(progress, context) {
+  const label = "personal boss";
+  try {
+    return await runStage(progress, context, label, runPersonalBoss);
+  } catch (error) {
+    context.report.actions.push({ type: "personal-boss", status: "failed", reason: safeError(error) });
+    context.report.warnings ??= [];
+    context.report.warnings.push(`${label}: ${safeError(error)}`);
+  }
+}
+
+async function authenticate({ api, account, accountState, state, statePath, save = () => saveState(statePath, state) }) {
   const credentialFingerprint = createHash("sha256").update(account.username).digest("hex");
   const fingerprintChanged = accountState.credentialFingerprint !== credentialFingerprint;
   if (accountState.credentialFingerprint && accountState.credentialFingerprint !== credentialFingerprint) {
@@ -121,7 +367,7 @@ async function authenticate({ api, account, accountState, state, statePath }) {
     accountState.actions = {};
   }
   accountState.credentialFingerprint = credentialFingerprint;
-  if (fingerprintChanged) await saveState(statePath, state);
+  if (fingerprintChanged) await save();
   if (accountState.session) {
     api.setSession(accountState.session);
     try {
@@ -130,7 +376,7 @@ async function authenticate({ api, account, accountState, state, statePath }) {
       if (!(error instanceof ApiError) || !error.authentication) throw error;
       delete accountState.session;
       delete accountState.sessionExpiresAt;
-      await saveState(statePath, state);
+      await save();
     }
   }
   const login = dataOf(await api.post("/api/auth/login", {
@@ -141,7 +387,7 @@ async function authenticate({ api, account, accountState, state, statePath }) {
   accountState.session = login.sessionToken;
   accountState.sessionExpiresAt = login.expiresAt;
   api.setSession(login.sessionToken);
-  await saveState(statePath, state);
+  await save();
   return dataOf(await api.get("/api/client/bootstrap"));
 }
 
@@ -260,35 +506,562 @@ async function optimizeMap(context) {
   context.report.actions.push({ type: "map", status: "changed", from: decision.current?.key, to: decision.best.key });
 }
 
-async function runDaily(context) {
+export async function runDaily(context) {
   let state = await readDailyState(context.api);
+  if (state.guild?.unavailable === true) {
+    context.report.actions.push({ type: "guild-progress-reward", status: "unavailable", reason: "state-read-failed" });
+    context.report.warnings ??= [];
+    context.report.warnings.push(`guild rewards: ${state.guild.reason}`);
+  } else if (state.guild?.joined === false) {
+    context.report.actions.push({ type: "guild-progress-reward", status: "unavailable", reason: "not-member" });
+  }
+  const targetEnabled = context.config.automation.daily.activityRewardPoints.includes(ACTIVITY_TARGET);
+  const initiallyComplete = activityTierClaimed(state, ACTIVITY_TARGET);
+  const failedRewards = new Set();
+  const activitySafety = { blocked: false };
+  state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  const equipmentResult = await runBestEquipment(context, state.bootstrap.player?.level);
+  state = await cleanEquipmentAndPursueActivity(
+    context,
+    state,
+    failedRewards,
+    activitySafety,
+    equipmentResult,
+    targetEnabled
+  );
+  if (!context.options.dryRun && activityStateKnown(state)) {
+    state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+    await runBestEquipment(context, state.bootstrap.player?.level);
+  }
+  reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled);
+}
+
+export async function runBestEquipment(context, knownPlayerLevel) {
+  const skippedSlots = new Set();
+  let safeForDecomposition = true;
+  let unsafeReason;
+  let equipment;
+  let playerLevel = Number(knownPlayerLevel);
+  try {
+    const bootstrapRequest = Number.isInteger(playerLevel) && playerLevel >= 1
+      ? undefined
+      : context.api.get("/api/client/bootstrap");
+    const [equipmentList, bootstrapPayload] = await Promise.all([
+      readEquipment(context.api),
+      bootstrapRequest
+    ]);
+    equipment = equipmentList;
+    if (bootstrapPayload) playerLevel = Number(dataOf(bootstrapPayload)?.player?.level);
+  } catch (error) {
+    context.report.actions.push({ type: "equipment-wear", status: "failed", reason: safeError(error) });
+    return { safeForDecomposition: false, equipment: undefined, reason: "equipment-state-read-failed" };
+  }
+  if (!Number.isInteger(playerLevel) || playerLevel < 1) {
+    context.report.actions.push({ type: "equipment-wear", status: "stopped", reason: "player-level-unknown" });
+    return { safeForDecomposition: false, equipment, reason: "player-level-unknown" };
+  }
   let mutations = 0;
-  while (mutations < 60) {
-    const action = nextDailyAction(state, context.config.automation.daily.activityRewardPoints);
-    if (!action) break;
+  while (mutations < EQUIPMENT_WEAR_LIMIT) {
+    const upgrade = chooseBestEquipmentUpgrade(equipment, skippedSlots, playerLevel);
+    if (!upgrade) {
+      const issue = equipmentComparisonIssue(equipment);
+      if (issue) {
+        context.report.actions.push({ type: "equipment-wear", status: "stopped", ...issue });
+        return { safeForDecomposition: false, equipment, reason: issue.reason };
+      }
+      return { safeForDecomposition, equipment, reason: unsafeReason };
+    }
+    const action = {
+      type: "equipment-wear",
+      slot: upgrade.slot,
+      fromScore: upgrade.currentScore,
+      toScore: upgrade.candidateScore
+    };
     if (context.options.dryRun) {
-      context.report.actions.push({ type: action.type, status: "planned", ...(action.point ? { point: action.point } : {}) });
-      state = pretendDailyClaimed(state, action);
+      context.report.actions.push({ ...action, status: "planned" });
+      equipment = simulateEquipmentWear(equipment, upgrade);
       mutations += 1;
       continue;
     }
+
+    let ambiguous = false;
+    try {
+      await context.api.post("/api/equipment/wear", { equipmentId: upgrade.candidate.id });
+    } catch (error) {
+      if (!error.ambiguous) {
+        context.report.actions.push({ ...action, status: "failed", reason: safeError(error) });
+        safeForDecomposition = false;
+        unsafeReason ??= "equipment-wear-failed";
+        skippedSlots.add(upgrade.slot);
+        continue;
+      }
+      ambiguous = true;
+    }
+    mutations += 1;
+    try {
+      equipment = await readEquipment(context.api);
+    } catch (error) {
+      context.report.actions.push({
+        ...action,
+        status: "uncertain",
+        reason: ambiguous ? "outcome-unknown" : `state-refresh-failed: ${safeError(error)}`
+      });
+      return {
+        safeForDecomposition: false,
+        equipment,
+        reason: ambiguous ? "equipment-wear-outcome-unknown" : "equipment-state-refresh-failed"
+      };
+    }
+    if (!equipment.some((item) => item?.id === upgrade.candidate.id && isEquipmentWorn(item))) {
+      context.report.actions.push({ ...action, status: "uncertain", reason: "state-not-confirmed" });
+      safeForDecomposition = false;
+      unsafeReason ??= "equipment-wear-not-confirmed";
+      skippedSlots.add(upgrade.slot);
+      continue;
+    }
+    context.report.actions.push({ ...action, status: ambiguous ? "reconciled" : "completed" });
+  }
+
+  if (chooseBestEquipmentUpgrade(equipment, skippedSlots, playerLevel)) {
+    context.report.actions.push({ type: "equipment-wear", status: "stopped", reason: "mutation-limit" });
+    return { safeForDecomposition: false, equipment, reason: "equipment-wear-mutation-limit" };
+  }
+  return { safeForDecomposition, equipment, reason: unsafeReason };
+}
+
+function simulateEquipmentWear(equipment, upgrade) {
+  return equipment.map((item) => {
+    if (item?.id === upgrade.candidate.id) return { ...item, status: "equipped", equipped: true };
+    if (item?.id === upgrade.current?.id) return { ...item, status: "in_bag", equipped: false };
+    return item;
+  });
+}
+
+async function claimDailyRewards(context, initialState, failedRewards, activitySafety) {
+  let state = initialState;
+  let mutations = 0;
+  const dryRunPlanned = new Set();
+  while (mutations < ACTIVITY_MUTATION_LIMIT) {
+    const excludedRewards = dryRunPlanned.size > 0
+      ? new Set([...failedRewards, ...dryRunPlanned])
+      : failedRewards;
+    const action = nextDailyAction(state, context.config.automation.daily.activityRewardPoints, excludedRewards);
+    if (!action) break;
+    const identity = dailyActionIdentity(action, state);
+    if (context.options.dryRun) {
+      context.report.actions.push(dailyActionReport(action, "planned"));
+      if (action.type === "activity-reward") dryRunPlanned.add(identity);
+      else state = pretendDailyClaimed(state, action);
+      mutations += 1;
+      continue;
+    }
+
     try {
       await context.api.post(action.path, action.body);
-      state = await readDailyState(context.api);
-      if (dailyActionStillPending(state, action)) throw new Error(`${action.type} was not confirmed by state refresh`);
-      context.report.actions.push({ type: action.type, status: "claimed", ...(action.point ? { point: action.point } : {}) });
     } catch (error) {
-      if (!error.ambiguous) throw error;
-      state = await readDailyState(context.api);
-      if (dailyActionStillPending(state, action)) throw error;
-      context.report.actions.push({ type: action.type, status: "reconciled", ...(action.point ? { point: action.point } : {}) });
+      if (error.ambiguous) {
+        state = await readDailyState(context.api);
+        const outcome = dailyActionOutcome(state, action);
+        if (outcome === "claimed") {
+          context.report.actions.push(dailyActionReport(action, "reconciled"));
+        } else {
+          failedRewards.add(identity);
+          if (action.type === "activity-reward" && action.point === ACTIVITY_TARGET) {
+            activitySafety.blocked = true;
+          }
+          context.report.actions.push({
+            ...dailyActionReport(action, outcome === "unknown" ? "uncertain" : "failed"),
+            reason: outcome === "unknown" ? "claim outcome was not available after state refresh" : safeError(error)
+          });
+        }
+      } else {
+        failedRewards.add(identity);
+        context.report.actions.push({ ...dailyActionReport(action, "failed"), reason: safeError(error) });
+      }
+      mutations += 1;
+      continue;
+    }
+
+    state = await readDailyState(context.api);
+    const outcome = dailyActionOutcome(state, action);
+    if (outcome !== "claimed") {
+      failedRewards.add(identity);
+      if (action.type === "activity-reward" && action.point === ACTIVITY_TARGET) {
+        activitySafety.blocked = true;
+      }
+      context.report.actions.push({
+        ...dailyActionReport(action, outcome === "unknown" ? "uncertain" : "failed"),
+        reason: outcome === "unknown"
+          ? `${action.type} could not be confirmed because refreshed state omitted its collection`
+          : `${action.type} was not confirmed by state refresh`
+      });
+    } else {
+      context.report.actions.push(dailyActionReport(action, "claimed"));
     }
     mutations += 1;
   }
-  if (mutations >= 60) throw new Error("daily claim safety limit exceeded");
-  if (Number(state.view.navigation?.activityClaimableCount ?? 0) > 0) {
+  if (mutations >= ACTIVITY_MUTATION_LIMIT
+    && nextDailyAction(state, context.config.automation.daily.activityRewardPoints, failedRewards)) {
+    failedRewards.add(DAILY_REWARD_LIMIT_IDENTITY);
+    context.report.actions.push({ type: "daily-rewards", status: "stopped", reason: "mutation-limit" });
+  }
+  return state;
+}
+
+async function cleanEquipmentAndPursueActivity(
+  context,
+  initialState,
+  failedRewards,
+  activitySafety,
+  initialEquipmentResult,
+  targetEnabled
+) {
+  let state = initialState;
+  let equipmentResult = initialEquipmentResult;
+  const settings = context.config.automation.daily;
+  const skippedEquipment = new Set();
+  let consecutivePreviewFailures = 0;
+  if (context.options.dryRun && equipmentResult.safeForDecomposition) {
+    const protectedCount = countProtectedDecomposition(equipmentResult.equipment, settings.decomposition);
+    if (protectedCount > 0) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "protected",
+        reason: "premium-or-unknown-affix",
+        count: protectedCount
+      });
+    }
+  }
+  while (true) {
+    if (!equipmentResult.safeForDecomposition) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "stopped",
+        reason: equipmentResult.reason ?? "equipment-comparison-unsafe"
+      });
+      return state;
+    }
+    const equipment = equipmentResult.equipment;
+    const candidates = safeDecompositionCandidates(equipment, settings.decomposition)
+      .filter((item) => !skippedEquipment.has(item.id))
+      .slice(0, DECOMPOSITION_BATCH_SIZE);
+    if (candidates.length === 0) break;
+    const equipmentIds = candidates.map((candidate) => candidate.id);
+    if (context.options.dryRun) {
+      for (const candidate of candidates) {
+        context.report.actions.push({
+          type: "equipment-decompose",
+          status: "planned",
+          quality: candidate.quality,
+          level: candidate.level,
+          reason: "daily-cleanup"
+        });
+        skippedEquipment.add(candidate.id);
+      }
+      continue;
+    }
+
+    try {
+      const preview = dataOf(await context.api.post("/api/equipment/decompose-preview", { equipmentIds }));
+      if (!safeDecompositionPreview(preview, equipmentIds)) {
+        for (const equipmentId of equipmentIds) skippedEquipment.add(equipmentId);
+        consecutivePreviewFailures = 0;
+        context.report.actions.push({ type: "equipment-decompose", status: "skipped", count: equipmentIds.length, reason: "preview-unconfirmed" });
+        continue;
+      }
+      consecutivePreviewFailures = 0;
+    } catch (error) {
+      context.report.actions.push({ type: "equipment-decompose", status: "failed", count: equipmentIds.length, reason: safeError(error) });
+      if (transientRequestFailure(error)) {
+        consecutivePreviewFailures += 1;
+        if (consecutivePreviewFailures >= 3) {
+          context.report.actions.push({ type: "equipment-decompose", status: "stopped", reason: "preview-failure-limit" });
+          return state;
+        }
+      } else {
+        for (const equipmentId of equipmentIds) skippedEquipment.add(equipmentId);
+        consecutivePreviewFailures = 0;
+      }
+      continue;
+    }
+
+    const beforeCount = finiteCounter(state.bootstrap.daily?.decomposeCount);
+    let ambiguousError;
+    try {
+      await context.api.post("/api/equipment/decompose", { equipmentIds });
+    } catch (error) {
+      if (!error.ambiguous) {
+        for (const equipmentId of equipmentIds) skippedEquipment.add(equipmentId);
+        context.report.actions.push({ type: "equipment-decompose", status: "failed", count: equipmentIds.length, reason: safeError(error) });
+        continue;
+      }
+      ambiguousError = error;
+    }
+    const [refreshedState, refreshedEquipment] = await Promise.all([
+      readDailyState(context.api),
+      readEquipment(context.api)
+    ]);
+    state = refreshedState;
+    const remainingEquipmentIds = new Set(refreshedEquipment.map((item) => item?.id));
+    const confirmed = counterIncreased(beforeCount, state.bootstrap.daily?.decomposeCount)
+      && equipmentIds.every((equipmentId) => !remainingEquipmentIds.has(equipmentId));
+    if (!confirmed) {
+      context.report.actions.push({
+        type: "equipment-decompose",
+        status: "uncertain",
+        count: equipmentIds.length,
+        reason: ambiguousError ? "outcome-unknown" : "state-not-confirmed"
+      });
+      return state;
+    }
+    context.report.actions.push({
+      type: "equipment-decompose",
+      status: ambiguousError ? "reconciled" : "completed",
+      count: equipmentIds.length
+    });
+    if (targetEnabled
+      && activityStateKnown(state)
+      && !activityTierClaimed(state, ACTIVITY_TARGET)
+      && !activityPursuitBlocked(failedRewards, activitySafety)) {
+      allowActivityRewardRetry(failedRewards);
+      state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+      equipmentResult = await runBestEquipment(context, state.bootstrap.player?.level);
+    } else {
+      equipmentResult = { safeForDecomposition: true, equipment: refreshedEquipment };
+    }
+  }
+  if (!targetEnabled) return state;
+  if (!activityStateKnown(state)) {
+    context.report.actions.push({ type: "activity-target", status: "stopped", reason: "unknown-activity-state" });
+    return state;
+  }
+  if (activityPursuitBlocked(failedRewards, activitySafety)) {
+    context.report.actions.push({ type: "activity-target", status: "stopped", reason: "reward-claim-blocked" });
+    return state;
+  }
+  if (activityTierClaimed(state, ACTIVITY_TARGET)) return state;
+  return purchaseActivityItem(context, state, failedRewards, activitySafety);
+}
+
+async function purchaseActivityItem(context, state, failedRewards, activitySafety) {
+  const marketBuyCount = finiteCounter(state.bootstrap.daily?.marketBuyCount);
+  if (marketBuyCount === undefined) {
+    context.report.actions.push({ type: "market-buy", status: "skipped", reason: "unknown-daily-count" });
+    return state;
+  }
+  if (marketBuyCount > 0) {
+    context.report.actions.push({ type: "market-buy", status: "skipped", reason: "daily-purchase-used" });
+    return state;
+  }
+  const ordersData = dataOf(await context.api.get("/api/market/orders"));
+  const orders = Array.isArray(ordersData) ? ordersData : ordersData?.orders ?? [];
+  const selected = chooseLowestChargeMarketOrder(orders, context.config.automation.daily.marketMaxGold);
+  if (!selected) {
+    context.report.actions.push({ type: "market-buy", status: "skipped", reason: "no-eligible-order" });
+    return state;
+  }
+  if (context.options.dryRun) {
+    context.report.actions.push({
+      type: "market-buy",
+      status: "planned",
+      quantity: 1,
+      projectedGold: selected.charge,
+      reason: "if-activity-target-remains"
+    });
+    return state;
+  }
+
+  let ambiguousError;
+  try {
+    await context.api.post("/api/market/buy", { orderId: selected.order.id, quantity: 1 });
+  } catch (error) {
+    if (!error.ambiguous) {
+      context.report.actions.push({ type: "market-buy", status: "failed", projectedGold: selected.charge, reason: safeError(error) });
+      return state;
+    }
+    ambiguousError = error;
+  }
+  state = await readDailyState(context.api);
+  if (!counterIncreased(marketBuyCount, state.bootstrap.daily?.marketBuyCount)) {
+    context.report.actions.push({ type: "market-buy", status: "uncertain", projectedGold: selected.charge, reason: "outcome-unknown" });
+    return state;
+  }
+  context.report.actions.push({
+    type: "market-buy",
+    status: ambiguousError ? "reconciled" : "completed",
+    quantity: 1,
+    projectedGold: selected.charge
+  });
+  allowActivityRewardRetry(failedRewards);
+  state = await claimDailyRewards(context, state, failedRewards, activitySafety);
+  return state;
+}
+
+function reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled) {
+  if (!activityStateKnown(state)) {
+    context.report.activity = {
+      status: "incomplete",
+      claimed: [],
+      remaining: [...context.config.automation.daily.activityRewardPoints],
+      failedRewards: failedRewards.size,
+      reason: "unknown-activity-state"
+    };
+    context.report.actions.push({
+      type: "activity-target",
+      status: "pending",
+      point: ACTIVITY_TARGET,
+      reason: "unknown-activity-state"
+    });
+    return;
+  }
+  const claimed = new Set(state.bootstrap.daily?.claimedActivity ?? []);
+  const complete = claimed.has(ACTIVITY_TARGET);
+  const remaining = context.config.automation.daily.activityRewardPoints.filter((point) => !claimed.has(point));
+  context.report.activity = {
+    status: complete ? (initiallyComplete ? "already-complete" : "newly-complete") : "incomplete",
+    claimed: context.config.automation.daily.activityRewardPoints.filter((point) => claimed.has(point)),
+    remaining,
+    failedRewards: failedRewards.size
+  };
+  if (!targetEnabled) {
+    context.report.activity.reason = "target-not-configured";
+    context.report.actions.push({ type: "activity-target", status: "skipped", point: ACTIVITY_TARGET, reason: "not-configured" });
+    return;
+  }
+  if (!complete) {
+    context.report.actions.push({ type: "activity-target", status: "pending", point: ACTIVITY_TARGET, remaining });
+  }
+  if (Number(state.view.navigation?.activityClaimableCount ?? 0) > 0 && remaining.length === 0) {
     context.report.actions.push({ type: "activity-reward", status: "pending", reason: "unknown-tier" });
   }
+}
+
+export async function runPersonalBoss(context) {
+  let state = await readBossState(context.api);
+  let submissions = 0;
+  while (submissions < BOSS_SUBMISSION_LIMIT) {
+    const freeBefore = personalBossFreeRemaining(state);
+    if (freeBefore === undefined) {
+      context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "unknown-free-pool" });
+      return;
+    }
+    if (freeBefore <= 0) {
+      context.report.actions.push({ type: "personal-boss", status: "no-free-attempt" });
+      return;
+    }
+
+    const candidate = await selectBossCandidate(context, state);
+    if (!candidate) {
+      context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "no-eligible-candidate" });
+      return;
+    }
+    const action = bossAction(candidate, context.options.dryRun ? "planned" : undefined);
+    if (context.options.dryRun) {
+      context.report.actions.push(action);
+      return;
+    }
+
+    const bossCountBefore = finiteCounter(state.bootstrap.daily?.bossCount);
+    let result;
+    let ambiguous = false;
+    try {
+      result = dataOf(await context.api.post("/api/boss/challenge", candidate.body));
+    } catch (error) {
+      if (!error.ambiguous) throw error;
+      ambiguous = true;
+    }
+    submissions += 1;
+    state = await readBossState(context.api);
+    const freeAfter = personalBossFreeRemaining(state);
+    const bossCountAfter = finiteCounter(state.bootstrap.daily?.bossCount);
+    const outcome = reconcileBossChallenge({ result, ambiguous, freeBefore, freeAfter, bossCountBefore, bossCountAfter });
+    context.report.actions.push({ ...action, status: outcome.status });
+    if (!outcome.continue) {
+      context.report.actions.push({ type: "personal-boss", status: "stopped", reason: outcome.reason });
+      return;
+    }
+  }
+  context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "submission-limit", submissions });
+}
+
+async function selectBossCandidate(context, state) {
+  for (const layer of personalBossPreviewLayers(state.view.bosses, state.equipment)) {
+    const previews = [];
+    for (const buffKey of layer.buffKeys) {
+      const body = { ...layer.body, buffKey };
+      try {
+        const preview = await bossPreview(context.api, body);
+        previews.push({ buffKey, body, preview });
+      } catch (error) {
+        context.report.warnings ??= [];
+        context.report.warnings.push(`boss preview skipped: ${safeError(error)}`);
+      }
+    }
+    const selected = chooseBossPreview(previews);
+    if (selected) return { ...layer, ...selected };
+  }
+  return undefined;
+}
+
+async function bossPreview(api, body) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return dataOf(await api.post("/api/boss/preview", body));
+    } catch (error) {
+      const retriable = !error.status || error.status === 409 || error.status === 429 || error.status >= 500;
+      if (!retriable || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+    }
+  }
+}
+
+function reconcileBossChallenge({ result, ambiguous, freeBefore, freeAfter, bossCountBefore, bossCountAfter }) {
+  if (!Number.isFinite(freeAfter) || freeAfter > freeBefore || freeBefore - freeAfter > 1) {
+    return { status: "uncertain", continue: false, reason: "free-pool-conflict" };
+  }
+  const won = result?.battle?.win;
+  if (!ambiguous && won === true && freeAfter === freeBefore - 1) return { status: "won", continue: true };
+  if (!ambiguous && won === false && freeAfter === freeBefore
+    && bossCountAfter !== undefined && bossCountBefore !== undefined && bossCountAfter > bossCountBefore) {
+    return { status: "lost-free-returned", continue: true };
+  }
+  if (ambiguous && freeAfter === freeBefore - 1) return { status: "reconciled-win", continue: true };
+  if (ambiguous && freeAfter === freeBefore && bossCountAfter !== undefined && bossCountBefore !== undefined && bossCountAfter > bossCountBefore) {
+    return { status: "reconciled-loss", continue: true };
+  }
+  return { status: "uncertain", continue: false, reason: "challenge-outcome-unknown" };
+}
+
+function bossAction(candidate, status) {
+  return {
+    type: "personal-boss",
+    ...(status ? { status } : {}),
+    bossKey: candidate.body.bossKey,
+    difficulty: candidate.body.difficulty,
+    buffKey: candidate.body.buffKey,
+    affixKey: candidate.body.affixKey,
+    ...(candidate.body.targetSlot ? { targetSlot: candidate.body.targetSlot } : {}),
+    chance: Number(candidate.preview.chance),
+    rewardMultiplier: candidate.rewardMultiplier,
+    costGold: Number(candidate.difficulty.goldCost),
+    costMaterial: Number(candidate.difficulty.materialCost)
+  };
+}
+
+function personalBossFreeRemaining(state) {
+  const bootstrap = finiteCounter(state.bootstrap.player?.personalBossAttempts?.freeRemaining);
+  const viewValues = (state.view.bosses ?? [])
+    .filter((boss) => boss?.type === "personal")
+    .map((boss) => finiteCounter(boss.personalAttemptPool?.freeRemaining))
+    .filter((value) => value !== undefined);
+  const view = viewValues.length > 0 && viewValues.every((value) => value === viewValues[0]) ? viewValues[0] : undefined;
+  if (bootstrap !== undefined && view !== undefined && bootstrap !== view) return undefined;
+  return bootstrap ?? view;
+}
+
+function finiteCounter(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : undefined;
 }
 
 async function runArcade(context) {
@@ -482,47 +1255,80 @@ function explicitValues(value, key, found = []) {
   return found;
 }
 
-export function nextDailyAction(state, knownActivityPoints) {
-  const { bootstrap, view } = state;
+export function nextDailyAction(state, knownActivityPoints, failedRewards = new Set()) {
+  const { bootstrap, view, guild } = state;
   const day = bootstrap.daily?.key;
   const signIn = bootstrap.retention?.signIn ?? {};
-  if (day && signIn.lastClaimedKey !== day && !(signIn.claimedKeys ?? []).includes(day)) {
+  if (day && signIn.lastClaimedKey !== day && !(signIn.claimedKeys ?? []).includes(day) && !failedRewards.has(dailyRewardIdentity("sign-in", day))) {
     return { type: "sign-in", path: "/api/retention/sign-in", body: {} };
   }
-  const quest = (view.quests ?? []).find((entry) => entry.available === true && entry.completed === true && entry.claimed !== true);
+  const quest = (view.quests ?? []).find((entry) => validRewardKey(entry?.key) && entry.available === true && entry.completed === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("quest-reward", entry.key)));
   if (quest) return { type: "quest-reward", path: "/api/quests/claim", body: { questKey: quest.key }, identity: quest.key };
-  const achievement = (view.achievements ?? []).find((entry) => entry.unlocked === true && entry.claimed !== true);
+  const achievement = (view.achievements ?? []).find((entry) => validRewardKey(entry?.key) && entry.unlocked === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("achievement-reward", entry.key)));
   if (achievement) return { type: "achievement-reward", path: "/api/achievements/claim", body: { achievementKey: achievement.key }, identity: achievement.key };
-  const codex = (view.codex?.rewards ?? []).find((entry) => entry.unlocked === true && entry.claimed !== true);
+  const codex = (view.codex?.rewards ?? []).find((entry) => validRewardKey(entry?.key) && entry.unlocked === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("codex-reward", entry.key)));
   if (codex) return { type: "codex-reward", path: "/api/codex/claim", body: { rewardKey: codex.key }, identity: codex.key };
-  const season = (view.rankingSeason?.rewards ?? []).find((entry) => entry.unlocked === true && entry.claimed !== true);
+  const season = (view.rankingSeason?.rewards ?? []).find((entry) => validRewardKey(entry?.key) && entry.unlocked === true && entry.claimed !== true && !failedRewards.has(dailyRewardIdentity("season-reward", entry.key)));
   if (season) return { type: "season-reward", path: "/api/ranking/season/claim", body: { rewardKey: season.key }, identity: season.key };
-  const claimed = new Set(bootstrap.daily?.claimedActivity ?? []);
-  if (Number(view.navigation?.activityClaimableCount ?? 0) > 0) {
+  const guildReward = guild?.joined === true && (guild.progressRewards ?? []).find((entry) => {
+    return Number.isInteger(entry?.point) && entry.point > 0
+      && entry.canClaim === true
+      && entry.claimed !== true
+      && !failedRewards.has(dailyRewardIdentity("guild-progress-reward", entry.point));
+  });
+  if (guildReward) return { type: "guild-progress-reward", path: "/api/guild/claim-progress", body: { point: guildReward.point }, point: guildReward.point };
+  const claimedActivity = bootstrap.daily?.claimedActivity;
+  if (Array.isArray(claimedActivity)) {
+    const claimed = new Set(claimedActivity);
     const point = knownActivityPoints.find((candidate) => !claimed.has(candidate));
-    if (point !== undefined) return { type: "activity-reward", path: "/api/daily/claim", body: { point }, point };
+    if (point !== undefined && !failedRewards.has(dailyRewardIdentity("activity-reward", point))) {
+      return { type: "activity-reward", path: "/api/daily/claim", body: { point }, point };
+    }
   }
   const claimedMail = new Set(bootstrap.claimedMailRewardIds ?? []);
-  const mail = (bootstrap.mails ?? []).find((entry) => entry.claimed !== true && !claimedMail.has(entry.id) && hasMailReward(entry.reward));
+  const mail = (bootstrap.mails ?? []).find((entry) => validRewardKey(entry?.id) && entry.claimed !== true && !claimedMail.has(entry.id) && hasMailReward(entry.reward) && !failedRewards.has(dailyRewardIdentity("mail-attachment", entry.id)));
   if (mail) return { type: "mail-attachment", path: "/api/mail/claim", body: { mailId: mail.id }, identity: mail.id };
   return undefined;
 }
 
-function dailyActionStillPending(state, action) {
+function dailyActionOutcome(state, action) {
   const { bootstrap, view } = state;
   if (action.type === "sign-in") {
     const day = bootstrap.daily?.key;
-    const signIn = bootstrap.retention?.signIn ?? {};
-    return Boolean(day && signIn.lastClaimedKey !== day && !(signIn.claimedKeys ?? []).includes(day));
+    const signIn = bootstrap.retention?.signIn;
+    if (!day || !signIn || typeof signIn !== "object") return "unknown";
+    return signIn.lastClaimedKey === day || (signIn.claimedKeys ?? []).includes(day) ? "claimed" : "pending";
   }
-  if (action.type === "quest-reward") return view.quests?.some((entry) => entry.key === action.identity && entry.available && entry.completed && !entry.claimed);
-  if (action.type === "achievement-reward") return view.achievements?.some((entry) => entry.key === action.identity && entry.unlocked && !entry.claimed);
-  if (action.type === "codex-reward") return view.codex?.rewards?.some((entry) => entry.key === action.identity && entry.unlocked && !entry.claimed);
-  if (action.type === "season-reward") return view.rankingSeason?.rewards?.some((entry) => entry.key === action.identity && entry.unlocked && !entry.claimed);
-  if (action.type === "activity-reward") return !(bootstrap.daily?.claimedActivity ?? []).includes(action.point);
-  if (action.type === "mail-attachment") return (bootstrap.mails ?? []).some((entry) => entry.id === action.identity && !entry.claimed)
-    && !(bootstrap.claimedMailRewardIds ?? []).includes(action.identity);
-  return true;
+  if (action.type === "quest-reward") return collectionRewardOutcome(view.quests, action.identity, (entry) => entry.available === true && entry.completed === true);
+  if (action.type === "achievement-reward") return collectionRewardOutcome(view.achievements, action.identity, (entry) => entry.unlocked === true);
+  if (action.type === "codex-reward") return collectionRewardOutcome(view.codex?.rewards, action.identity, (entry) => entry.unlocked === true);
+  if (action.type === "season-reward") return collectionRewardOutcome(view.rankingSeason?.rewards, action.identity, (entry) => entry.unlocked === true);
+  if (action.type === "guild-progress-reward") {
+    if (!Array.isArray(state.guild?.progressRewards)) return "unknown";
+    const entry = state.guild.progressRewards.find((candidate) => candidate?.point === action.point);
+    return entry?.canClaim === true && entry.claimed !== true ? "pending" : "claimed";
+  }
+  if (action.type === "activity-reward") {
+    if (!Array.isArray(bootstrap.daily?.claimedActivity)) return "unknown";
+    return bootstrap.daily.claimedActivity.includes(action.point) ? "claimed" : "pending";
+  }
+  if (action.type === "mail-attachment") {
+    if (!Array.isArray(bootstrap.mails) || !Array.isArray(bootstrap.claimedMailRewardIds)) return "unknown";
+    if (bootstrap.claimedMailRewardIds.includes(action.identity)) return "claimed";
+    const entry = bootstrap.mails.find((candidate) => candidate?.id === action.identity);
+    return entry?.claimed === false ? "pending" : "claimed";
+  }
+  return "unknown";
+}
+
+function collectionRewardOutcome(collection, identity, eligible) {
+  if (!Array.isArray(collection)) return "unknown";
+  const entry = collection.find((candidate) => candidate?.key === identity);
+  return entry && eligible(entry) && entry.claimed !== true ? "pending" : "claimed";
+}
+
+function validRewardKey(value) {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function pretendDailyClaimed(state, action) {
@@ -532,10 +1338,12 @@ function pretendDailyClaimed(state, action) {
   else if (action.type === "achievement-reward") clone.view.achievements.find((entry) => entry.key === action.identity).claimed = true;
   else if (action.type === "codex-reward") clone.view.codex.rewards.find((entry) => entry.key === action.identity).claimed = true;
   else if (action.type === "season-reward") clone.view.rankingSeason.rewards.find((entry) => entry.key === action.identity).claimed = true;
+  else if (action.type === "guild-progress-reward") clone.guild.progressRewards.find((entry) => entry.point === action.point).claimed = true;
   else if (action.type === "activity-reward") {
     clone.bootstrap.daily.claimedActivity ??= [];
     clone.bootstrap.daily.claimedActivity.push(action.point);
-    clone.view.navigation.activityClaimableCount = Math.max(0, Number(clone.view.navigation.activityClaimableCount) - 1);
+    clone.view.navigation ??= {};
+    clone.view.navigation.activityClaimableCount = Math.max(0, Number(clone.view.navigation.activityClaimableCount ?? 0) - 1);
   } else if (action.type === "mail-attachment") clone.bootstrap.mails.find((entry) => entry.id === action.identity).claimed = true;
   return clone;
 }
@@ -557,8 +1365,35 @@ async function readIdleState(api) {
 }
 
 async function readDailyState(api) {
-  const [bootstrap, view] = await Promise.all([api.get("/api/client/bootstrap"), api.get("/api/client/dynamic-view")]);
-  return { bootstrap: dataOf(bootstrap), view: dataOf(view) };
+  const guildRequest = api.get("/api/guild/view")
+    .then((payload) => dataOf(payload))
+    .catch((error) => ({ unavailable: true, reason: safeError(error) }));
+  const [bootstrap, view, guild] = await Promise.all([
+    api.get("/api/client/bootstrap"),
+    api.get("/api/client/dynamic-view"),
+    guildRequest
+  ]);
+  return { bootstrap: dataOf(bootstrap), view: dataOf(view), guild };
+}
+
+async function readEquipment(api) {
+  const data = dataOf(await api.get("/api/equipment/list"));
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.equipment)) return data.equipment;
+  throw new Error("equipment list response was malformed");
+}
+
+async function readBossState(api) {
+  const [bootstrap, view, equipment] = await Promise.all([
+    api.get("/api/client/bootstrap"),
+    api.get("/api/client/dynamic-view"),
+    readEquipment(api)
+  ]);
+  return {
+    bootstrap: dataOf(bootstrap),
+    view: dataOf(view),
+    equipment
+  };
 }
 
 async function readArcadeState(api) {
@@ -625,12 +1460,76 @@ function hasMailReward(reward) {
   return Object.entries(reward).some(([key, value]) => key !== "items" && Number(value) > 0);
 }
 
+function dailyActionIdentity(action, state) {
+  if (action.identity !== undefined) return dailyRewardIdentity(action.type, action.identity);
+  if (action.point !== undefined) return dailyRewardIdentity(action.type, action.point);
+  if (action.type === "sign-in") return dailyRewardIdentity("sign-in", state.bootstrap.daily?.key ?? "unknown");
+  return dailyRewardIdentity(action.type);
+}
+
+function dailyRewardIdentity(type, identity) {
+  return identity === undefined ? type : `${type}:${identity}`;
+}
+
+function dailyActionReport(action, status) {
+  return {
+    type: action.type,
+    status,
+    ...(action.point !== undefined ? { point: action.point } : {}),
+    ...(action.identity !== undefined ? { identity: action.identity } : {})
+  };
+}
+
+function activityTierClaimed(state, point) {
+  return Array.isArray(state.bootstrap.daily?.claimedActivity)
+    && state.bootstrap.daily.claimedActivity.includes(point);
+}
+
+function activityStateKnown(state) {
+  return Array.isArray(state.bootstrap.daily?.claimedActivity);
+}
+
+function activityPursuitBlocked(failedRewards, activitySafety) {
+  return activitySafety.blocked || failedRewards.has(DAILY_REWARD_LIMIT_IDENTITY);
+}
+
+function allowActivityRewardRetry(failedRewards) {
+  for (const identity of failedRewards) {
+    if (identity.startsWith("activity-reward:")) failedRewards.delete(identity);
+  }
+}
+
+function safeDecompositionPreview(preview, equipmentIds) {
+  if (!Array.isArray(equipmentIds) || equipmentIds.length === 0) return false;
+  const expected = new Set(equipmentIds);
+  return expected.size === equipmentIds.length
+    && Number(preview?.equipmentCount) === equipmentIds.length
+    && Array.isArray(preview?.equipmentIds)
+    && preview.equipmentIds.length === equipmentIds.length
+    && preview.equipmentIds.every((equipmentId) => expected.delete(equipmentId))
+    && expected.size === 0;
+}
+
+function transientRequestFailure(error) {
+  return error?.ambiguous === true
+    || !Number.isFinite(Number(error?.status))
+    || error.status === 409
+    || error.status === 429
+    || error.status >= 500;
+}
+
+function counterIncreased(before, after) {
+  const previous = finiteCounter(before);
+  const next = finiteCounter(after);
+  return previous !== undefined && next !== undefined && next > previous;
+}
+
 function assertNodeVersion() {
   const major = Number(process.versions.node.split(".", 1)[0]);
   if (!Number.isInteger(major) || major < 24) throw new Error("Node.js 24 or newer is required");
 }
 
-function applyDefaults(config) {
+export function applyDefaults(config) {
   const automation = config.automation ?? {};
   return {
     ...config,
@@ -644,12 +1543,23 @@ function applyDefaults(config) {
         urgentLeadMinutes: automation.idle?.urgentLeadMinutes ?? 30
       },
       arcade: { treasureSafeCards: automation.arcade?.treasureSafeCards ?? 2 },
-      daily: { activityRewardPoints: automation.daily?.activityRewardPoints ?? [20] }
+      daily: {
+        activityRewardPoints: automation.daily?.activityRewardPoints ?? KNOWN_ACTIVITY_POINTS,
+        marketMaxGold: automation.daily?.marketMaxGold ?? 300,
+        decomposition: {
+          qualities: (automation.daily?.decomposition?.qualities ?? ["white", "green", "blue", "purple", "orange"])
+            .map((quality) => QUALITY_ALIASES[String(quality).toLowerCase()] ?? quality),
+          minLevel: automation.daily?.decomposition?.minLevel,
+          maxLevel: automation.daily?.decomposition?.maxLevel ?? 999,
+          maxScore: automation.daily?.decomposition?.maxScore ?? 99_999,
+          protectPremiumAffixes: automation.daily?.decomposition?.protectPremiumAffixes ?? false
+        }
+      }
     }
   };
 }
 
-function validateConfig(config) {
+export function validateConfig(config) {
   if (!Array.isArray(config.accounts) || config.accounts.length === 0) throw new Error("account config contains no accounts");
   const names = new Set();
   for (const [index, account] of config.accounts.entries()) {
@@ -666,9 +1576,27 @@ function validateConfig(config) {
   if (!Number.isInteger(config.automation.logRetentionDays) || config.automation.logRetentionDays < 1) throw new Error("logRetentionDays must be a positive integer");
   if (Number(config.automation.arcade.treasureSafeCards) < 1) throw new Error("treasureSafeCards must be at least 1");
   const points = config.automation.daily.activityRewardPoints;
-  if (!Array.isArray(points) || points.some((point) => !Number.isInteger(point) || point < 1)) {
-    throw new Error("activityRewardPoints must be an array of positive integers");
+  if (!Array.isArray(points) || points.length === 0 || points.some((point) => !KNOWN_ACTIVITY_POINTS.includes(point)) || new Set(points).size !== points.length) {
+    throw new Error(`activityRewardPoints must contain unique known tiers: ${KNOWN_ACTIVITY_POINTS.join(", ")}`);
   }
+  const marketMaxGold = config.automation.daily.marketMaxGold;
+  if (!Number.isInteger(marketMaxGold) || marketMaxGold < 0) throw new Error("marketMaxGold must be a non-negative integer");
+  const decomposition = config.automation.daily.decomposition;
+  if (!Array.isArray(decomposition.qualities) || decomposition.qualities.length === 0 || decomposition.qualities.some((quality) => !QUALITY_KEYS.has(quality))) {
+    throw new Error("decomposition qualities contain an unknown quality");
+  }
+  for (const key of ["minLevel", "maxLevel"]) {
+    if (decomposition[key] !== undefined && (!Number.isInteger(decomposition[key]) || decomposition[key] < 1)) {
+      throw new Error(`decomposition ${key} must be a positive integer`);
+    }
+  }
+  if (decomposition.minLevel !== undefined && decomposition.maxLevel !== undefined && decomposition.minLevel > decomposition.maxLevel) {
+    throw new Error("decomposition minLevel must not exceed maxLevel");
+  }
+  if (!Number.isFinite(decomposition.maxScore) || decomposition.maxScore <= 0) {
+    throw new Error("decomposition maxScore must be a positive number");
+  }
+  if (typeof decomposition.protectPremiumAffixes !== "boolean") throw new Error("protectPremiumAffixes must be boolean");
 }
 
 function selectAccounts(accounts, requested) {
@@ -726,33 +1654,44 @@ async function saveState(statePath, state) {
   await chmod(statePath, 0o600);
 }
 
-async function acquireLock() {
+async function acquireLock(waitMs = 0) {
   await ensurePrivateDirectory(path.dirname(LOCK_FILE), "runtime directory");
-  let handle;
-  try {
-    handle = await open(LOCK_FILE, "wx", 0o600);
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    const lockInfo = await lstat(LOCK_FILE);
-    if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) throw new Error("run lock must be a regular non-symlink file");
-    let running = true;
+  const deadline = Date.now() + waitMs;
+  while (true) {
     try {
-      const pid = Number(await readFile(LOCK_FILE, "utf8"));
-      if (!Number.isInteger(pid) || pid < 1) running = false;
-      else process.kill(pid, 0);
-    } catch (checkError) {
-      if (checkError.code === "ESRCH" || checkError instanceof SyntaxError) running = false;
-      else if (checkError.code === "ENOENT") return acquireLock();
+      const handle = await open(LOCK_FILE, "wx", 0o600);
+      await handle.writeFile(String(process.pid));
+      await handle.close();
+      return async () => {
+        try { await unlink(LOCK_FILE); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const lockInfo = await lstat(LOCK_FILE).catch((lockError) => {
+        if (lockError.code === "ENOENT") return undefined;
+        throw lockError;
+      });
+      if (!lockInfo) continue;
+      if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) throw new Error("run lock must be a regular non-symlink file");
+      let running = true;
+      try {
+        const pid = Number(await readFile(LOCK_FILE, "utf8"));
+        if (!Number.isInteger(pid) || pid < 1) running = false;
+        else process.kill(pid, 0);
+      } catch (checkError) {
+        if (checkError.code === "ESRCH" || checkError instanceof SyntaxError) running = false;
+        else if (checkError.code === "ENOENT") continue;
+      }
+      if (!running) {
+        await unlink(LOCK_FILE).catch((unlinkError) => {
+          if (unlinkError.code !== "ENOENT") throw unlinkError;
+        });
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error("another automation process is already running");
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    if (running) throw new Error("another automation process is already running");
-    await unlink(LOCK_FILE);
-    return acquireLock();
   }
-  await handle.writeFile(String(process.pid));
-  await handle.close();
-  return async () => {
-    try { await unlink(LOCK_FILE); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  };
 }
 
 async function appendReports(logDir, reports, retentionDays) {
@@ -810,8 +1749,94 @@ function pruneActions(actions) {
 }
 
 function safeError(error) {
-  if (error instanceof ApiError) return `${error.path ?? "request"}: ${error.authentication ? "authentication rejected" : error.ambiguous ? "outcome uncertain after network failure" : "request rejected"}`;
-  return String(error?.message ?? "unknown error").replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
+  if (error instanceof ApiError) {
+    let reason = "request rejected";
+    if (error.authentication) reason = "authentication rejected";
+    else if (error.transport) reason = error.ambiguous ? "outcome uncertain after network failure" : "network request failed";
+    else if (error.requiredVersion) reason = `client upgrade failed (server requires ${error.requiredVersion})`;
+    else if (error.detail) reason = `request rejected (${safeErrorText(error.detail)})`;
+    return `${error.path ?? "request"}: ${reason}`;
+  }
+  return safeErrorText(error?.message ?? "unknown error");
+}
+
+function safeErrorText(value) {
+  return String(value)
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+export function createProgressReporter({ enabled = true, write = console.log, now = () => Date.now() } = {}) {
+  if (!enabled) return createSilentProgressReporter();
+  const startedAt = now();
+  let writable = true;
+  const safeWrite = (line) => {
+    if (!writable) return;
+    try {
+      write(line);
+    } catch {
+      writable = false;
+    }
+  };
+
+  return {
+    start({ command, total, dryRun }) {
+      safeWrite(`Starting ${command}${dryRun ? " dry run" : ""} for ${total} ${pluralize(total, "account")}.`);
+    },
+    account({ alias, current, total }) {
+      const prefix = `[${current}/${total}] ${alias}`;
+      const accountStartedAt = now();
+      safeWrite(`${prefix}: starting`);
+      return {
+        async stage(label, operation, describeResult) {
+          const stageStartedAt = now();
+          safeWrite(`${prefix}: ${label}...`);
+          try {
+            const result = await operation();
+            const detail = describeResult?.(result);
+            safeWrite(`${prefix}: ${label} done (${formatDuration(now() - stageStartedAt)}${detail ? `, ${detail}` : ""})`);
+            return result;
+          } catch (error) {
+            safeWrite(`${prefix}: ${label} failed (${formatDuration(now() - stageStartedAt)}): ${safeError(error)}`);
+            throw error;
+          }
+        },
+        finish({ ok, error }) {
+          safeWrite(`${prefix}: ${ok ? "completed" : `failed (${error})`} (${formatDuration(now() - accountStartedAt)})`);
+        }
+      };
+    },
+    finish({ succeeded, failed }) {
+      safeWrite(`Finished: ${succeeded} succeeded, ${failed} failed (${formatDuration(now() - startedAt)}).`);
+    }
+  };
+}
+
+function createSilentProgressReporter() {
+  return {
+    start() {},
+    account() {
+      return {
+        stage(_label, operation) { return operation(); },
+        finish() {}
+      };
+    },
+    finish() {}
+  };
+}
+
+function formatDuration(milliseconds) {
+  return `${(Math.max(0, milliseconds) / 1_000).toFixed(1)}s`;
+}
+
+function formatResultCount(count) {
+  return `${count} ${pluralize(count, "result")}`;
+}
+
+function pluralize(count, singular) {
+  return count === 1 ? singular : `${singular}s`;
 }
 
 function formatReports(reports) {
@@ -826,7 +1851,7 @@ function formatReports(reports) {
 }
 
 function printHelp() {
-  console.log(`PlaceGame daily automation\n\nUsage:\n  node placegame-auto.mjs [run|status|idle|daily|arcade] [options]\n\nOptions:\n  --config <path>   Account config (default: .placegame-accounts.local.json)\n  --state <path>    Private Session/action state\n  --log-dir <path>  Redacted JSONL report directory\n  --account <alias> Run one configured account\n  --dry-run         Read state and report planned mutations\n  --json            Print structured output\n  --help            Show this help`);
+  console.log(`PlaceGame daily automation\n\nUsage:\n  node placegame-auto.mjs [run|status|idle|daily|arcade|boss|world-boss] [options]\n\nOptions:\n  --config <path>   Account config (default: .placegame-accounts.local.json)\n  --state <path>    Private Session/action state\n  --log-dir <path>  Redacted JSONL report directory\n  --account <alias> Run one configured account\n  --dry-run         Read state and report planned mutations\n  --json            Print structured output\n  --help            Show this help`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
