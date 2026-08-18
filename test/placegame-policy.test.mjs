@@ -134,6 +134,17 @@ test("personal boss layers prioritize progression, difficulty, and reward multip
   ])[0].body, "targetSlot"), false);
 });
 
+test("personal boss layers disable material boost for normal difficulty", () => {
+  const layers = personalBossPreviewLayers([personalBoss()], []);
+  const relentlessLayers = layers.filter((layer) => layer.body.affixKey === "relentless");
+
+  assert.deepEqual(relentlessLayers.map((layer) => [layer.body.difficulty, layer.body.useMaterialBoost]), [
+    ["nightmare", true],
+    ["hard", true],
+    ["normal", false]
+  ]);
+});
+
 test("personal boss layers select at most the three strongest combat skills", () => {
   const boss = personalBoss();
   boss.challengeOptions.skills = [
