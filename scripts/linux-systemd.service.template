@@ -9,4 +9,3 @@ WorkingDirectory="__PROJECT__"
 ExecStart="__NODE__" "__PROJECT__/placegame-auto.mjs" run
 UMask=0077
 NoNewPrivileges=true
-PrivateTmp=true
