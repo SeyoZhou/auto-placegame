@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory="__PROJECT__"
+WorkingDirectory=__PROJECT__
 ExecStart="__NODE__" "__PROJECT__/scripts/world-boss-scheduler.mjs"
 Restart=always
 RestartSec=10s

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory="__PROJECT__"
+WorkingDirectory=__PROJECT__
 ExecStart="__NODE__" "__PROJECT__/placegame-auto.mjs" run
 UMask=0077
 NoNewPrivileges=true
