@@ -536,7 +536,7 @@ export async function runDaily(context) {
   reportActivityOutcome(context, state, initiallyComplete, failedRewards, targetEnabled);
 }
 
-export async function runBestEquipment(context, knownPlayerLevel) {
+export async function runBestEquipment(context, knownPlayerLevel, knownEquipment) {
   const skippedSlots = new Set();
   let safeForDecomposition = true;
   let unsafeReason;
@@ -547,7 +547,7 @@ export async function runBestEquipment(context, knownPlayerLevel) {
       ? undefined
       : context.api.get("/api/client/bootstrap");
     const [equipmentList, bootstrapPayload] = await Promise.all([
-      readEquipment(context.api),
+      knownEquipment ?? readEquipment(context.api),
       bootstrapRequest
     ]);
     equipment = equipmentList;
@@ -979,6 +979,14 @@ export async function runPersonalBoss(context) {
     if (!outcome.continue) {
       context.report.actions.push({ type: "personal-boss", status: "stopped", reason: outcome.reason });
       return;
+    }
+    if (["won", "reconciled-win"].includes(outcome.status)) {
+      const equipmentResult = await runBestEquipment(context, state.bootstrap.player?.level, state.equipment);
+      if (!equipmentResult.safeForDecomposition) {
+        context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "equipment-update-unsafe" });
+        return;
+      }
+      state.equipment = equipmentResult.equipment;
     }
   }
   context.report.actions.push({ type: "personal-boss", status: "stopped", reason: "submission-limit", submissions });

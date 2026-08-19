@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ApiError } from "../lib/placegame-api.mjs";
 import { executeWorldBossSession } from "../lib/placegame-world-boss.mjs";
 
-test("world boss session drains lower bosses across accounts with at most three accounts in flight", async () => {
+test("world boss session submits one lower-boss assist per account with at most three accounts in flight", async () => {
   let inFlight = 0;
   let maximumInFlight = 0;
   const order = [];
@@ -30,12 +30,12 @@ test("world boss session drains lower bosses across accounts with at most three 
   });
 
   assert.equal(maximumInFlight, 3);
-  assert.equal(order.length, 24);
-  assert.equal(order.slice(0, 12).every((entry) => entry.startsWith("low:")), true);
+  assert.equal(order.length, 4);
+  assert.equal(order.every((entry) => entry.startsWith("low:")), true);
   assert.equal(result.completed, true);
   for (const client of clients) {
-    assert.equal(client.counts.low, 0);
-    assert.equal(client.counts.high, 0);
+    assert.equal(client.counts.low, 2);
+    assert.equal(client.counts.high, 3);
   }
 });
 
@@ -54,9 +54,9 @@ test("world boss session refreshes after every assist and isolates an ambiguous 
   });
 
   assert.equal(uncertain.counts.low, 3);
-  assert.equal(uncertain.counts.high, 0);
-  assert.equal(healthy.counts.low, 0);
-  assert.equal(healthy.counts.high, 0);
+  assert.equal(uncertain.counts.high, 1);
+  assert.equal(healthy.counts.low, 1);
+  assert.equal(healthy.counts.high, 1);
   assert.equal(uncertain.posts.filter((entry) => entry === "low").length, 1);
   assert.equal(result.reports.get("uncertain").actions.some((action) => action.status === "uncertain"), true);
   assert.equal(state.worldBoss.events["2026-08-18@16:00"].accounts.uncertain.pairs["low:low-instance"].status, "uncertain");
@@ -70,6 +70,18 @@ test("world boss session refreshes after every assist and isolates an ambiguous 
   assert.equal(resumed.completed, false);
   assert.deepEqual(resumed.unresolvedAliases, ["uncertain"]);
   assert.equal(uncertain.posts.filter((entry) => entry === "low").length, 1);
+});
+
+test("world boss session persists the one-submission account limit", async () => {
+  const client = fakeClient("single", { low: 3, high: 3 });
+  const state = { version: 1, accounts: {} };
+  const event = { id: "2026-08-18@16:00" };
+
+  await executeWorldBossSession({ clients: [client], event, state, saveState: async () => {} });
+  await executeWorldBossSession({ clients: [client], event, state, saveState: async () => {} });
+
+  assert.deepEqual(client.posts, ["low"]);
+  assert.equal(state.worldBoss.events[event.id].accounts.single.assistSubmitted, true);
 });
 
 test("world boss dry run reads plans but performs no mutations", async () => {

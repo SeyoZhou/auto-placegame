@@ -252,7 +252,7 @@ test("world boss dry run plans the current event without assist or reward mutati
     status: "planned",
     bossKey: "low",
     instanceId: "instance",
-    attempts: 3
+    attempts: 1
   });
 });
 
@@ -744,6 +744,27 @@ test("personal boss submits the exact previewed challenge body", async () => {
     useMaterialBoost: true,
     buffKey: "none"
   }]);
+});
+
+test("personal boss wears a won upgrade before choosing the next target slot", async () => {
+  const api = createBossApi({
+    freeRemaining: 2,
+    consumeFree: true,
+    targetSlots: ["weapon", "armor"],
+    equipment: [
+      { id: "weapon-current", status: "equipped", slot: "weapon", level: 1, score: 10 },
+      { id: "armor-current", status: "equipped", slot: "armor", level: 1, score: 20 }
+    ],
+    rewardEquipmentByChallenge: {
+      1: { id: "weapon-upgrade", status: "in_bag", slot: "weapon", level: 1, score: 30 }
+    }
+  });
+  const context = bossContext(api);
+
+  await runPersonalBoss(context);
+
+  assert.deepEqual(api.challengeBodies.map((body) => body.targetSlot), ["weapon", "armor"]);
+  assert.deepEqual(api.wearBodies, [{ equipmentId: "weapon-upgrade" }]);
 });
 
 test("personal boss retries returned failures and stops after twenty submissions", async () => {
@@ -1481,25 +1502,28 @@ function createBossApi({
   previewResult = { chance: 88, predictedWin: true },
   ambiguousChallenge = false,
   consumeFree = false,
-  recordBossAttempt = true
+  recordBossAttempt = true,
+  targetSlots = ["weapon"],
+  equipment = [{ id: "eq-1", status: "equipped", slot: "weapon", level: 1, score: 10 }],
+  rewardEquipmentByChallenge = {}
 }) {
   let remaining = freeRemaining;
   let bossCount = 0;
   return {
+    equipment: structuredClone(equipment),
     previewCalls: 0,
     challengeCalls: 0,
     challengeBodies: [],
+    wearBodies: [],
     async get(pathName) {
       if (pathName === "/api/client/bootstrap") return { data: {
         daily: { bossCount },
-        player: { personalBossAttempts: { freeRemaining: remaining } }
+        player: { level: 100, personalBossAttempts: { freeRemaining: remaining } }
       } };
       if (pathName === "/api/client/dynamic-view") return { data: {
-        bosses: [bossFixture(remaining)]
+        bosses: [bossFixture(remaining, targetSlots)]
       } };
-      if (pathName === "/api/equipment/list") return { data: [
-        { id: "eq-1", status: "equipped", slot: "weapon", score: 10 }
-      ] };
+      if (pathName === "/api/equipment/list") return { data: structuredClone(this.equipment) };
       assert.fail(`unexpected GET ${pathName}`);
     },
     async post(pathName, body) {
@@ -1512,15 +1536,23 @@ function createBossApi({
         this.challengeBodies.push(structuredClone(body));
         if (recordBossAttempt) bossCount += 1;
         if (consumeFree) remaining -= 1;
+        if (rewardEquipmentByChallenge[this.challengeCalls]) {
+          this.equipment.push(structuredClone(rewardEquipmentByChallenge[this.challengeCalls]));
+        }
         if (ambiguousChallenge) throw Object.assign(new Error("lost response"), { ambiguous: true });
         return { data: challengeResult ?? { battle: { win: true } } };
+      }
+      if (pathName === "/api/equipment/wear") {
+        this.wearBodies.push(structuredClone(body));
+        wearEquipment(this.equipment, body.equipmentId);
+        return { data: {} };
       }
       assert.fail(`unexpected POST ${pathName}`);
     }
   };
 }
 
-function bossFixture(freeRemaining) {
+function bossFixture(freeRemaining, targetSlots = ["weapon"]) {
   return {
     key: "boss-1",
     type: "personal",
@@ -1540,7 +1572,7 @@ function bossFixture(freeRemaining) {
       skills: [{ key: "skill-1" }],
       buffs: [{ key: "none" }],
       affixes: [{ key: "relentless", rewardMultiplier: 1.18 }],
-      targetSlots: ["weapon"]
+      targetSlots
     }
   };
 }
