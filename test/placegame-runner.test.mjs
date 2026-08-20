@@ -256,6 +256,214 @@ test("world boss dry run plans the current event without assist or reward mutati
   });
 });
 
+test("world boss resumes an event completed by the obsolete per-account policy", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-world-boss-policy-migration-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  const statePath = path.join(directory, "state.json");
+  await writeFile(configPath, '{"accounts":[{"name":"test","username":"u","password":"p"}]}\n');
+  await chmod(configPath, 0o600);
+  await writeFile(statePath, JSON.stringify({
+    version: 1,
+    accounts: {},
+    worldBoss: {
+      events: {
+        "2026-08-20@16:00": {
+          status: "completed",
+          accounts: {
+            test: {
+              assistSubmitted: true,
+              assistBossKey: "low",
+              pairs: {
+                "low:low-instance": {
+                  status: "completed",
+                  bossKey: "low",
+                  instanceId: "low-instance",
+                  attempts: 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }));
+  await chmod(statePath, 0o600);
+  let highRemaining = 3;
+  const requests = [];
+  const output = [];
+  const fetchImpl = async (url, options) => {
+    const pathName = new URL(url).pathname;
+    requests.push({ path: pathName, method: options.method });
+    let data;
+    if (pathName === "/api/auth/login") data = { sessionToken: "session" };
+    else if (pathName === "/api/client/bootstrap") data = {};
+    else if (pathName === "/api/boss/world-status") data = [{
+      bossKey: "low",
+      instanceId: "low-instance",
+      status: "active",
+      remainingAttemptCount: 2,
+      maxAttemptCount: 3,
+      requiredLevel: 10,
+      rewardStatus: "pending"
+    }, {
+      bossKey: "high",
+      instanceId: "high-instance",
+      status: "active",
+      remainingAttemptCount: highRemaining,
+      maxAttemptCount: 3,
+      requiredLevel: 80,
+      rewardStatus: "pending"
+    }];
+    else if (pathName === "/api/client/dynamic-view") data = {
+      bosses: [
+        { key: "low", type: "world", requiredLevel: 10, assistBlockedReason: null },
+        { key: "high", type: "world", requiredLevel: 80, assistBlockedReason: null }
+      ]
+    };
+    else if (pathName === "/api/boss/assist") {
+      assert.equal(JSON.parse(options.body).bossKey, "high");
+      highRemaining -= 1;
+      data = {};
+    } else assert.fail(`unexpected request: ${options.method} ${pathName}`);
+    return { ok: true, status: 200, json: async () => ({ data }) };
+  };
+
+  assert.equal(await main([
+    "world-boss",
+    "--config", configPath,
+    "--state", statePath,
+    "--log-dir", path.join(directory, "logs"),
+    "--json"
+  ], {
+    currentDate: () => new Date("2026-08-20T08:00:00.000Z"),
+    fetchImpl,
+    outputWrite: (line) => output.push(line)
+  }), 0);
+
+  assert.equal(requests.filter((request) => request.path === "/api/boss/assist").length, 1);
+  assert.equal(JSON.parse(output[0]).reports[0].actions.some((action) => {
+    return action.type === "world-boss-assist" && action.status === "assisted" && action.bossKey === "high";
+  }), true);
+});
+
+test("world boss skips an event completed by the current per-boss policy", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-world-boss-completed-policy-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  const statePath = path.join(directory, "state.json");
+  await writeFile(configPath, '{"accounts":[{"name":"test","username":"u","password":"p"}]}\n');
+  await chmod(configPath, 0o600);
+  await writeFile(statePath, JSON.stringify({
+    version: 1,
+    accounts: {},
+    worldBoss: {
+      events: {
+        "2026-08-20@16:00": {
+          status: "completed",
+          assistPolicy: "one-assist-per-boss-v1",
+          accounts: {}
+        }
+      }
+    }
+  }));
+  await chmod(statePath, 0o600);
+  const output = [];
+
+  assert.equal(await main([
+    "world-boss",
+    "--config", configPath,
+    "--state", statePath,
+    "--log-dir", path.join(directory, "logs"),
+    "--json"
+  ], {
+    currentDate: () => new Date("2026-08-20T08:00:00.000Z"),
+    fetchImpl: async () => assert.fail("completed current-policy event must not use the network"),
+    outputWrite: (line) => output.push(line)
+  }), 0);
+
+  assert.deepEqual(JSON.parse(output[0]).reports[0].actions, [{
+    type: "world-boss",
+    status: "skipped",
+    reason: "event-already-completed",
+    eventId: "2026-08-20@16:00"
+  }]);
+});
+
+test("world boss account filter leaves the event resumable for other configured accounts", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "placegame-world-boss-account-filter-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = path.join(directory, "accounts.json");
+  const statePath = path.join(directory, "state.json");
+  await writeFile(configPath, JSON.stringify({ accounts: [
+    { name: "first", username: "first-user", password: "p" },
+    { name: "second", username: "second-user", password: "p" }
+  ] }));
+  await chmod(configPath, 0o600);
+  const sessions = new Map();
+  const remaining = { first: 3, second: 3 };
+  const assists = [];
+  const fetchImpl = async (url, options) => {
+    const pathName = new URL(url).pathname;
+    let data;
+    if (pathName === "/api/auth/login") {
+      const username = JSON.parse(options.body).username;
+      const alias = username.startsWith("first") ? "first" : "second";
+      const token = `${alias}-session`;
+      sessions.set(token, alias);
+      data = { sessionToken: token };
+    } else {
+      const token = options.headers.authorization?.replace("Bearer ", "");
+      const alias = sessions.get(token) ?? token?.replace("-session", "");
+      if (pathName === "/api/client/bootstrap") data = {};
+      else if (pathName === "/api/boss/world-status") data = [{
+        bossKey: "low",
+        instanceId: "low-instance",
+        status: "active",
+        remainingAttemptCount: remaining[alias],
+        maxAttemptCount: 3,
+        requiredLevel: 10,
+        rewardStatus: "pending"
+      }];
+      else if (pathName === "/api/client/dynamic-view") data = {
+        bosses: [{ key: "low", type: "world", requiredLevel: 10, assistBlockedReason: null }]
+      };
+      else if (pathName === "/api/boss/assist") {
+        assists.push(alias);
+        remaining[alias] -= 1;
+        data = {};
+      } else assert.fail(`unexpected request: ${options.method} ${pathName}`);
+    }
+    return { ok: true, status: 200, json: async () => ({ data }) };
+  };
+  const args = [
+    "world-boss",
+    "--config", configPath,
+    "--state", statePath,
+    "--log-dir", path.join(directory, "logs"),
+    "--json"
+  ];
+  const dependencies = {
+    currentDate: () => new Date("2026-08-20T08:00:00.000Z"),
+    fetchImpl,
+    outputWrite: () => {}
+  };
+
+  assert.equal(await main([...args, "--account", "first"], dependencies), 0);
+  assert.equal(await main(args, dependencies), 0);
+
+  assert.deepEqual(assists, ["first", "second"]);
+});
+
 test("accounts on the same server reuse a negotiated client version", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "placegame-version-negotiation-test-"));
   t.after(async () => {

@@ -39,7 +39,7 @@ import {
   stableJitterSeconds,
   stableKey
 } from "./lib/placegame-policy.mjs";
-import { executeWorldBossSession } from "./lib/placegame-world-boss.mjs";
+import { executeWorldBossSession, worldBossEventIsComplete } from "./lib/placegame-world-boss.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG = path.join(ROOT, ".placegame-accounts.local.json");
@@ -206,7 +206,7 @@ async function runWorldBossCommand({
     }
     return 0;
   }
-  if (state.worldBoss?.events?.[event.id]?.status === "completed") {
+  if (worldBossEventIsComplete(state.worldBoss?.events?.[event.id])) {
     for (const entry of entries) {
       entry.report.actions.push({ type: "world-boss", status: "skipped", reason: "event-already-completed", eventId: event.id });
       finishWorldBossEntry(entry, true);
@@ -252,7 +252,8 @@ async function runWorldBossCommand({
       state,
       saveState: writeState,
       dryRun: options.dryRun,
-      concurrency: 3
+      concurrency: 3,
+      allowEventCompletion: selected.length === config.accounts.length && clients.length === entries.length
     });
     for (const alias of session.unresolvedAliases) {
       const entry = entries.find((candidate) => candidate.alias === alias);
